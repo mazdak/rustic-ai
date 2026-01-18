@@ -1,0 +1,10 @@
+- Rust safety and reliability:
+  - Avoid `unsafe` in production; if required, isolate and document invariants/assumptions.
+  - Validate/sanitize external inputs (headers, query/body); use parameterized queries.
+  - Prefer `Option`/`Result` and `?` for propagation; avoid `unwrap`/`expect` on external data.
+    - Tests may use `unwrap`/`expect` for setup and assertions.
+  - Avoid blocking calls in async contexts; use async I/O or `spawn_blocking` for CPU-bound work.
+  - Enable overflow checks in release builds in `Cargo.toml`.
+- Mock external deps in tests (Twilio, OpenAI, etc.)
+- #![allow(dead_code)] is not allowed. No compiler warnings, no clippy warnings.
+- Never commit broken tests

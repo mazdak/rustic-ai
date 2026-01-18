@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${SKIP_FMT:-}" ]]; then
+  echo "SKIP_FMT set; skipping cargo fmt"
+else
+  cargo fmt --all --check
+fi
+
+if [[ -n "${SKIP_CLIPPY:-}" ]]; then
+  echo "SKIP_CLIPPY set; skipping cargo clippy"
+else
+  cargo clippy --all-targets --all-features -- -D warnings
+fi
