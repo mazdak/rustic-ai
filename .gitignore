@@ -1,3 +1,4 @@
-/target
+target/
+example-agent/target
 .env
 .env.*
