@@ -35,7 +35,33 @@ RusticAI is an agent framework built around a small set of extensible traits:
 The `Agent` orchestrates tool calling, manages message history, enforces usage
 limits, validates structured output, and returns a detailed `AgentRunResult`.
 
+Example:
+
+```rust
+use rustic_ai::{Agent, RunInput, UsageLimits, UserContent, infer_model, infer_provider};
+
+let model = infer_model("openai:gpt-4o-mini", infer_provider)?;
+let agent = Agent::new(model).system_prompt("Be helpful.");
+let input = RunInput::new(
+    vec![UserContent::Text("Hello!".to_string())],
+    vec![],
+    (),
+    UsageLimits::default(),
+);
+let result = agent.run(input).await?;
+println!("{}", result.output);
+```
+
 ## Core concepts
+
+Example:
+
+```rust
+use rustic_ai::{Agent, infer_model, infer_provider};
+
+let model = infer_model("openai:gpt-4o-mini", infer_provider)?;
+let _agent = Agent::new(model);
+```
 
 ### Agent
 
@@ -61,6 +87,19 @@ The run loop:
 4. Append tool results and continue
 5. Validate output schema (if configured)
 
+Example:
+
+```rust
+let input = RunInput::new(
+    vec![UserContent::Text("Summarize this.".to_string())],
+    vec![],
+    (),
+    UsageLimits::default(),
+);
+let result = agent.run(input).await?;
+println!("{}", result.output);
+```
+
 ### Model interface
 
 ```rust
@@ -84,6 +123,35 @@ pub trait Model: Send + Sync {
 }
 ```
 
+Example:
+
+```rust
+struct EchoModel;
+
+#[async_trait]
+impl Model for EchoModel {
+    fn name(&self) -> &str {
+        "echo"
+    }
+
+    async fn request(
+        &self,
+        _messages: &[ModelMessage],
+        _settings: Option<&ModelSettings>,
+        _params: &ModelRequestParameters,
+    ) -> Result<ModelResponse, ModelError> {
+        Ok(ModelResponse {
+            parts: vec![ModelResponsePart::Text(TextPart {
+                content: "ok".to_string(),
+            })],
+            usage: None,
+            model_name: Some("echo".to_string()),
+            finish_reason: Some("stop".to_string()),
+        })
+    }
+}
+```
+
 `ModelSettings` is a JSON map, allowing provider-specific parameters without
 hard-coding every field.
 
@@ -91,7 +159,7 @@ hard-coding every field.
 
 Built-in providers live in `src/providers`:
 
-- **OpenAI** (`OPENAI_API_KEY`) – Responses API (preferred) with Chat Completions fallback for audio input
+- **OpenAI** (`OPENAI_API_KEY`) – Responses API (preferred) with Chat Completions fallback for audio input and streaming
 - **Grok** (`XAI_API_KEY` or `GROK_API_KEY`) – OpenAI-compatible Chat Completions API
 - **Anthropic** (`ANTHROPIC_API_KEY`) – Messages API
 - **Gemini** (`GEMINI_API_KEY` or `GOOGLE_API_KEY`) – GenerateContent API
@@ -100,6 +168,19 @@ Built-in providers live in `src/providers`:
 
 ```rust
 let model = rustic_ai::infer_model("openai:gpt-4o-mini", rustic_ai::infer_provider)?;
+```
+
+Example (provider-specific settings):
+
+```rust
+use serde_json::json;
+
+let model = rustic_ai::infer_model("openai:gpt-4o-mini", rustic_ai::infer_provider)?;
+let settings = json!({ "temperature": 0.2 })
+    .as_object()
+    .expect("settings object")
+    .clone();
+let _agent = Agent::new(model).model_settings(settings);
 ```
 
 Providers serialize:
@@ -113,14 +194,32 @@ Providers serialize:
 
 - OpenAI Responses: uses `input_text`, `input_image`, and `input_file` (data URLs for binary images/PDFs)
 - OpenAI/Grok Chat: uses `image_url` (data URLs for binary images) and `input_audio` for audio binaries/data URLs
-- OpenAI Chat fallback is used when audio input is present (Responses does not accept audio inputs)
+- OpenAI Chat fallback is used when audio input is present or when streaming is requested (Responses does not accept audio inputs or streaming)
 - Anthropic: base64-encodes binary images/PDFs; text-like binaries are inlined as text
 - Gemini: uses `inlineData` for binaries and `fileData` for URLs (with MIME inference from URL when missing)
 
+Example:
+
+```rust
+use rustic_ai::{BinaryContent, RunInput, UsageLimits, UserContent};
+
+let input = RunInput::new(
+    vec![
+        UserContent::Binary(BinaryContent {
+            data: vec![0_u8; 16],
+            media_type: "image/png".to_string(),
+        }),
+        UserContent::Text("What is this?".to_string()),
+    ],
+    vec![],
+    (),
+    UsageLimits::default(),
+);
+```
+
 ### Realtime (voice)
 
-`rustic-ai` provides a Grok Realtime client (`realtime::grok`) that mirrors the
-voice stack in ResQ. It supports:
+`rustic-ai` provides a Grok Realtime client (`realtime::grok`) for voice agents. It supports:
 
 - WebSocket session setup (voice, tools, temperature, audio format)
 - Audio input/output events
@@ -144,8 +243,21 @@ Key types in `src/messages.rs`:
 
 - `ModelMessage`: request/response wrapper
 - `ModelRequestPart`: system/user prompt, tool return, retry prompt
-- `ModelResponsePart`: text or tool call
+- `ModelResponsePart`: text, tool call, or provider-specific items
 - `UserContent`: text, image, audio, video, document, binary
+
+Example:
+
+```rust
+use rustic_ai::{ModelMessage, ModelRequest, ModelRequestPart, UserContent, UserPromptPart};
+
+let message = ModelMessage::Request(ModelRequest {
+    parts: vec![ModelRequestPart::UserPrompt(UserPromptPart {
+        content: vec![UserContent::Text("Hello".to_string())],
+    })],
+    instructions: None,
+});
+```
 
 ## Tools
 
@@ -157,6 +269,13 @@ let tool = FunctionTool::new("add", "add two numbers", |ctx, args: AddArgs| asyn
 })?;
 ```
 
+Example (register a tool on an agent):
+
+```rust
+let mut agent = Agent::new(model);
+agent.tool(tool);
+```
+
 Tools return JSON values and are automatically embedded into `ToolReturnPart`.
 
 ### Execution controls
@@ -166,7 +285,7 @@ Each tool definition supports:
 - `sequential`: forces tool calls to execute one-at-a-time (and disables provider parallel tool calls)
 - `timeout`: per-tool timeout in seconds (timeout produces a tool error)
 
-Convenience helpers:
+Example:
 
 ```rust
 let tool = tool.with_sequential(true).with_timeout(15.0);
@@ -180,6 +299,12 @@ let tool = tool.with_sequential(true).with_timeout(15.0);
 - `External`: returned as deferred (requires approval)
 - `Unapproved`: returned as deferred
 
+Example:
+
+```rust
+let tool = tool.with_kind(ToolKind::External);
+```
+
 ## Deferred tool flow
 
 When the model emits a tool call for `External` or `Unapproved` tools, the agent
@@ -189,6 +314,16 @@ returns an `AgentRunResult` with:
 - `deferred_calls` listing tool name, arguments, and call id
 
 This enables human approval or external execution before continuing.
+
+Example:
+
+```rust
+if result.state == AgentRunState::Deferred {
+    for call in &result.deferred_calls {
+        println!("deferred tool: {} {}", call.tool_name, call.tool_call_id);
+    }
+}
+```
 
 ## Streaming
 
@@ -206,6 +341,22 @@ Streaming accounts for:
 
 Note: tool calls are returned as deferred; execution in streaming mode is caller-controlled.
 
+Example:
+
+```rust
+use futures::StreamExt;
+use rustic_ai::agent::AgentStreamEvent;
+
+let mut stream = agent.run_stream(input).await?;
+while let Some(event) = stream.next().await {
+    match event? {
+        AgentStreamEvent::TextDelta(delta) => print!("{delta}"),
+        AgentStreamEvent::ToolCall(call) => println!("tool call: {}", call.name),
+        AgentStreamEvent::Done(result) => println!("done: {}", result.output),
+    }
+}
+```
+
 ## Usage limits and accounting
 
 `UsageLimits` can constrain:
@@ -218,6 +369,18 @@ Note: tool calls are returned as deferred; execution in streaming mode is caller
 
 `RunUsage` tracks totals across the run, and is updated both for standard and
 streaming paths.
+
+Example:
+
+```rust
+use rustic_ai::UsageLimits;
+
+let limits = UsageLimits {
+    request_limit: Some(5),
+    tool_calls_limit: Some(3),
+    ..Default::default()
+};
+```
 
 ## Structured output
 
@@ -233,6 +396,22 @@ When an output schema is set, RusticAI also injects a system-level instruction
 requesting JSON that matches the schema. This provides prompted-output fallback
 for providers without native JSON schema response formats.
 
+Example:
+
+```rust
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct Summary {
+    title: String,
+    bullets: Vec<String>,
+}
+
+let schema = schemars::schema_for!(Summary);
+let agent = Agent::new(model).output_schema(serde_json::to_value(schema)?);
+```
+
 ## Failover and config resolvers
 
 Failover is based on `ResolvedModelConfig`:
@@ -245,6 +424,22 @@ pub struct ResolvedModelConfig {
     pub failover_on: HashSet<String>,
     pub settings: Map<String, Value>,
 }
+```
+
+Example:
+
+```rust
+use rustic_ai::run_with_failover;
+
+let result = run_with_failover(
+    &resolver,
+    "agent",
+    None,
+    None,
+    |model_name| async move { agent.run(input_for(model_name)).await },
+)
+.await?;
+println!("used {}", result.model_used);
 ```
 
 ### Resolver trait
@@ -261,10 +456,47 @@ pub trait ModelConfigResolver {
 }
 ```
 
+Example:
+
+```rust
+use std::collections::HashSet;
+use serde_json::Map;
+use rustic_ai::{ModelConfigResolver, ResolvedModelConfig};
+
+struct StaticResolver;
+
+impl ModelConfigResolver for StaticResolver {
+    fn resolve_model_config(
+        &self,
+        _agent_name: &str,
+        _requested_model: Option<&str>,
+        _environment: Option<&str>,
+    ) -> ResolvedModelConfig {
+        ResolvedModelConfig {
+            primary: "openai:gpt-4o-mini".to_string(),
+            backup: None,
+            retry_limit: 0,
+            failover_on: HashSet::new(),
+            settings: Map::new(),
+        }
+    }
+
+    fn resolve_utility_config(
+        &self,
+        _utility_name: &str,
+        _environment: Option<&str>,
+    ) -> ResolvedModelConfig {
+        self.resolve_model_config("", None, None)
+    }
+}
+```
+
 ### In-memory resolver
 
 `InMemoryResolver` is a minimal, non-opinionated resolver used for tests or
 custom integrations:
+
+Example:
 
 ```rust
 let mut resolver = InMemoryResolver::new("openai:gpt-4o-mini");
@@ -279,7 +511,7 @@ resolver.insert_agent(
 
 ## MCP toolsets (HTTP + SSE extras)
 
-`MCPServerHTTP` supports:
+`McpServerStreamableHttp` supports:
 
 - `tools/list` and `tools/call`
 - optional caching
@@ -287,6 +519,17 @@ resolver.insert_agent(
 - prompt retrieval
 - sampling
 - SSE event stream for cache invalidation and notifications
+
+Example:
+
+```rust
+use rustic_ai::mcp::McpServerStreamableHttp;
+
+let toolset = McpServerStreamableHttp::new("http://localhost:3333")?;
+let mut agent = Agent::new(model);
+agent.toolset(toolset);
+let result = agent.run_with_toolsets(input).await?;
+```
 
 See `src/mcp.rs` for request/response shapes and SSE handling.
 
@@ -303,7 +546,16 @@ Built-ins:
 - `NoopInstrumenter`
 - `TracingInstrumenter`
 
-These hooks are compatible with OpenTelemetry/Logfire-style tracing layers.
+Example:
+
+```rust
+use std::sync::Arc;
+use rustic_ai::TracingInstrumenter;
+
+let agent = Agent::new(model).instrumenter(Arc::new(TracingInstrumenter::default()));
+```
+
+These hooks are compatible with OpenTelemetry (OTEL)-style telemetry layers.
 
 ## Errors
 
@@ -321,12 +573,32 @@ Key error types:
 - `http_401`, `http_403`, `http_429`, `http_5xx`
 - `model_error`
 
+Example:
+
+```rust
+use rustic_ai::classify_error_kind;
+
+match agent.run(input).await {
+    Ok(result) => println!("{}", result.output),
+    Err(err) => {
+        let kind = classify_error_kind(&err as &dyn std::error::Error);
+        eprintln!("run failed ({:?}): {err}", kind);
+    }
+}
+```
+
 ## Testing and linting
 
 Run tests:
 
 ```bash
 cargo test
+```
+
+Example (run a single live test):
+
+```bash
+RUSTIC_AI_LIVE_TESTS=1 cargo test --test live_providers -- --ignored live_openai_tool_roundtrip
 ```
 
 Run live provider integration tests (opt-in, ignored by default):
@@ -365,22 +637,17 @@ Run clippy:
 cargo clippy --all-targets
 ```
 
-### Pre-commit hook
+### Pre-push hooks (pre-commit)
 
-Install the repo hooks (runs rustfmt + clippy before commits):
+Hooks are managed by pre-commit via `.pre-commit-config.yaml` and run on **pre-push**.
+Install them with:
 
 ```bash
-git config core.hooksPath .githooks
+uvx pre-commit install --hook-type pre-push
 ```
 
-Skip clippy for a single commit:
+If you already have `pre-commit` on your PATH, you can run:
 
 ```bash
-SKIP_CLIPPY=1 git commit ...
-```
-
-Skip rustfmt for a single commit:
-
-```bash
-SKIP_FMT=1 git commit ...
+pre-commit install --hook-type pre-push
 ```

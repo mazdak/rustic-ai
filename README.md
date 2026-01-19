@@ -13,13 +13,13 @@ and tool calling ergonomic.
 - **Deferred tools** for approval flows and external tooling
 - **Tool execution controls** (timeouts + sequential execution)
 - **MCP toolsets** (HTTP + SSE extras)
-- **Instrumentation hooks** (Tracing/Logfire-compatible)
+- **Instrumentation hooks** (Tracing/OTEL-compatible telemetry)
 - **Configurable failover** with pluggable resolvers
 - **Realtime Grok helpers** for voice agents (audio + tool calls)
 
 ## Provider notes
 
-- OpenAI defaults to the Responses API; audio inputs fall back to Chat Completions when supported by the model.
+- OpenAI defaults to the Responses API; audio inputs and streaming fall back to Chat Completions when supported by the model.
 - Grok uses the OpenAI-compatible Chat Completions API for tool calling.
 - Structured output schemas are normalized for OpenAI-compatible strict mode where supported.
 - Grok vision expects image URLs; binary image inputs are rejected.
