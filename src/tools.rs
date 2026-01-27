@@ -71,6 +71,7 @@ impl ToolDefinition {
 
 #[derive(Clone)]
 pub struct RunContext<Deps> {
+    pub run_id: String,
     pub deps: Arc<Deps>,
     pub model: Arc<dyn Model>,
     pub usage: RunUsage,
@@ -83,6 +84,7 @@ pub struct RunContext<Deps> {
 impl<Deps> RunContext<Deps> {
     pub fn for_tool_call(&self, tool_call_id: String, tool_name: String) -> Self {
         Self {
+            run_id: self.run_id.clone(),
             deps: Arc::clone(&self.deps),
             model: Arc::clone(&self.model),
             usage: self.usage.clone(),

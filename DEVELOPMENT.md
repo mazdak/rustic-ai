@@ -537,9 +537,29 @@ See `src/mcp.rs` for request/response shapes and SSE handling.
 
 Instrumentation is pluggable via `Instrumenter`:
 
+Run lifecycle:
+
+- `on_run_start`
+- `on_run_end`
+- `on_run_error`
+
+Model lifecycle:
+
 - `on_model_request`
 - `on_model_response`
+- `on_model_error`
+
+Tool lifecycle:
+
 - `on_tool_call`
+- `on_tool_start`
+- `on_tool_end`
+- `on_tool_error`
+
+Other:
+
+- `on_usage_limit`
+- `on_output_validation_error`
 
 Built-ins:
 
@@ -556,6 +576,21 @@ let agent = Agent::new(model).instrumenter(Arc::new(TracingInstrumenter::default
 ```
 
 These hooks are compatible with OpenTelemetry (OTEL)-style telemetry layers.
+`RunContext` includes a `run_id` field for correlation across logs and spans.
+
+Optional telemetry helpers are available behind feature flags:
+
+- `telemetry-otel` (OTLP exporter)
+- `telemetry-datadog` (Datadog exporter)
+
+Example (OTLP):
+
+```rust
+use opentelemetry_otlp::Protocol;
+use rustic_ai::telemetry::init_otlp_tracing;
+
+let _guard = init_otlp_tracing("rustic-ai", Protocol::Grpc, None, None)?;
+```
 
 ## Errors
 

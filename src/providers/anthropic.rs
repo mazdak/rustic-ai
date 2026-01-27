@@ -25,6 +25,15 @@ fn map_reqwest_error(label: &str, error: reqwest::Error) -> ModelError {
     ModelError::Transport(format!("{label} request failed: {error}"))
 }
 
+fn truncate_error_body(body: &str) -> String {
+    const LIMIT: usize = 512;
+    if body.len() <= LIMIT {
+        body.to_string()
+    } else {
+        format!("{}... ({} bytes)", &body[..LIMIT], body.len())
+    }
+}
+
 fn normalize_tool_call_id(id: Option<String>) -> String {
     match id {
         Some(value) if !value.trim().is_empty() => value,
@@ -480,6 +489,12 @@ impl Model for AnthropicModel {
         settings: Option<&ModelSettings>,
         params: &ModelRequestParameters,
     ) -> Result<ModelResponse, ModelError> {
+        tracing::debug!(
+            model = %self.model,
+            tool_count = params.function_tools.len(),
+            output_schema = params.output_schema.is_some(),
+            "Anthropic request"
+        );
         let (system, messages) = Self::split_system(messages);
         let mut body = Map::new();
         body.insert("model".to_string(), Value::String(self.model.clone()));
@@ -556,15 +571,26 @@ impl Model for AnthropicModel {
 
         let status = response.status();
         if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!(
+                status = status.as_u16(),
+                model = %self.model,
+                body = %truncate_error_body(&body),
+                "Anthropic request failed"
+            );
             return Err(ModelError::HttpStatus {
                 status: status.as_u16(),
             });
         }
 
-        let body: AnthropicResponse = response
-            .json()
-            .await
-            .map_err(|e| ModelError::Provider(format!("Anthropic response parse failed: {e}")))?;
+        let body: AnthropicResponse = response.json().await.map_err(|e| {
+            tracing::error!(
+                error = %e,
+                model = %self.model,
+                "Anthropic response parse failed"
+            );
+            ModelError::Provider(format!("Anthropic response parse failed: {e}"))
+        })?;
 
         let mut parts = Vec::new();
         for content in body.content {

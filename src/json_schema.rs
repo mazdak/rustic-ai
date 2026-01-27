@@ -31,8 +31,43 @@ const STRICT_COMPATIBLE_STRING_FORMATS: [&str; 9] = [
 
 pub(crate) fn transform_openai_schema(schema: &Value, strict: Option<bool>) -> (Value, bool) {
     let mut transformer = OpenAIJsonSchemaTransformer::new(schema.clone(), strict);
-    let schema = transformer.walk();
+    let mut schema = transformer.walk();
+    if strict == Some(true) {
+        enforce_strict_root(&mut schema);
+    }
     (schema, transformer.is_strict_compatible)
+}
+
+fn enforce_strict_root(schema: &mut Value) {
+    let Value::Object(map) = schema else {
+        return;
+    };
+
+    let has_props = matches!(map.get("properties"), Some(Value::Object(_)));
+    let is_object = map
+        .get("type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value == "object")
+        || has_props;
+
+    if !is_object {
+        return;
+    }
+
+    map.entry("type".to_string())
+        .or_insert_with(|| Value::String("object".to_string()));
+    map.insert("additionalProperties".to_string(), Value::Bool(false));
+
+    if !map.contains_key("required")
+        && let Some(Value::Object(properties)) = map.get("properties")
+    {
+        let required = properties
+            .keys()
+            .cloned()
+            .map(Value::String)
+            .collect::<Vec<_>>();
+        map.insert("required".to_string(), Value::Array(required));
+    }
 }
 
 struct OpenAIJsonSchemaTransformer {
@@ -40,6 +75,7 @@ struct OpenAIJsonSchemaTransformer {
     strict: Option<bool>,
     root_ref: Option<String>,
     defs: HashMap<String, Value>,
+    legacy_defs: HashMap<String, Value>,
     is_strict_compatible: bool,
 }
 
@@ -56,11 +92,19 @@ impl OpenAIJsonSchemaTransformer {
                 .collect(),
             _ => HashMap::new(),
         };
+        let legacy_defs = match schema.get("definitions") {
+            Some(Value::Object(map)) => map
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            _ => HashMap::new(),
+        };
         Self {
             schema,
             strict,
             root_ref,
             defs,
+            legacy_defs,
             is_strict_compatible: true,
         }
     }
@@ -72,6 +116,7 @@ impl OpenAIJsonSchemaTransformer {
         };
 
         let defs = root.remove("$defs");
+        let legacy_defs = root.remove("definitions");
         let handled = self.handle(Value::Object(root));
 
         let mut handled = match handled {
@@ -79,13 +124,26 @@ impl OpenAIJsonSchemaTransformer {
             other => return other,
         };
 
+        let mut handled_defs: Option<Map<String, Value>> = None;
         if let Some(Value::Object(defs_map)) = defs {
             let mut new_defs = Map::new();
             for (key, value) in defs_map {
                 new_defs.insert(key, self.handle(value));
             }
             if !new_defs.is_empty() {
+                handled_defs = Some(new_defs.clone());
                 handled.insert("$defs".to_string(), Value::Object(new_defs));
+            }
+        }
+        let mut handled_legacy_defs: Option<Map<String, Value>> = None;
+        if let Some(Value::Object(defs_map)) = legacy_defs {
+            let mut new_defs = Map::new();
+            for (key, value) in defs_map {
+                new_defs.insert(key, self.handle(value));
+            }
+            if !new_defs.is_empty() {
+                handled_legacy_defs = Some(new_defs.clone());
+                handled.insert("definitions".to_string(), Value::Object(new_defs));
             }
         }
 
@@ -94,9 +152,42 @@ impl OpenAIJsonSchemaTransformer {
             && let Value::Object(ref mut map) = result
         {
             map.remove("$ref");
-            let root_key = root_ref.strip_prefix("#/$defs/").unwrap_or(&root_ref);
-            if let Some(definition) = self.defs.get(root_key) {
-                match definition.clone() {
+            let definition = if let Some(root_key) = root_ref.strip_prefix("#/$defs/") {
+                handled_defs
+                    .as_ref()
+                    .and_then(|defs| defs.get(root_key))
+                    .cloned()
+                    .or_else(|| {
+                        self.defs
+                            .get(root_key)
+                            .cloned()
+                            .map(|value| self.handle(value))
+                    })
+            } else if let Some(root_key) = root_ref.strip_prefix("#/definitions/") {
+                handled_legacy_defs
+                    .as_ref()
+                    .and_then(|defs| defs.get(root_key))
+                    .cloned()
+                    .or_else(|| {
+                        self.legacy_defs
+                            .get(root_key)
+                            .cloned()
+                            .map(|value| self.handle(value))
+                    })
+            } else {
+                handled_defs
+                    .as_ref()
+                    .and_then(|defs| defs.get(root_ref.as_str()))
+                    .cloned()
+                    .or_else(|| {
+                        self.defs
+                            .get(root_ref.as_str())
+                            .cloned()
+                            .map(|value| self.handle(value))
+                    })
+            };
+            if let Some(definition) = definition {
+                match definition {
                     Value::Object(def_map) => {
                         for (key, value) in def_map {
                             map.insert(key, value);
@@ -423,5 +514,49 @@ mod tests {
             .expect("value schema");
         assert!(value_schema.contains_key("anyOf"));
         assert!(!value_schema.contains_key("oneOf"));
+    }
+
+    #[test]
+    fn strict_definitions_are_transformed() {
+        let schema = json!({
+            "$ref": "#/definitions/Widget",
+            "definitions": {
+                "Widget": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"}
+                    }
+                }
+            }
+        });
+
+        let (output, _strict_ok) = transform_openai_schema(&schema, Some(true));
+        let obj = output.as_object().expect("schema object");
+        assert_eq!(obj.get("type"), Some(&Value::String("object".to_string())));
+        assert_eq!(obj.get("additionalProperties"), Some(&Value::Bool(false)));
+        let props = obj
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .expect("properties");
+        assert!(props.contains_key("name"));
+    }
+
+    #[test]
+    fn strict_root_enforces_additional_properties() {
+        let schema = json!({
+            "properties": {
+                "name": {"type": "string"}
+            }
+        });
+
+        let (output, _strict_ok) = transform_openai_schema(&schema, Some(true));
+        let obj = output.as_object().expect("schema object");
+        assert_eq!(obj.get("type"), Some(&Value::String("object".to_string())));
+        assert_eq!(obj.get("additionalProperties"), Some(&Value::Bool(false)));
+        let required = obj
+            .get("required")
+            .and_then(|value| value.as_array())
+            .expect("required array");
+        assert!(required.contains(&Value::String("name".to_string())));
     }
 }

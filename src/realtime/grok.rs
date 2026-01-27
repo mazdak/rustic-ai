@@ -14,7 +14,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, http::Request},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::messages::ToolCallPart;
 
@@ -750,7 +750,7 @@ impl GrokClient {
                             match serde_json::from_value::<ServerEvent>(value.clone()) {
                                 Ok(event) => {
                                     if matches!(event, ServerEvent::Unknown) {
-                                        debug!(event_type = %event_type, raw = %text, "Unhandled Grok event");
+                                        trace!(event_type = %event_type, raw = %text, "Unhandled Grok event");
                                     } else if event.audio_delta().is_none() {
                                         debug!(?event, "Received Grok event");
                                     }
@@ -763,14 +763,15 @@ impl GrokClient {
                                     warn!(
                                         error = %e,
                                         event_type = %event_type,
-                                        raw = %text,
                                         "Failed to parse Grok event"
                                     );
+                                    trace!(raw = %text, "Grok event parse failure payload");
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!(error = %e, raw = %text, "Failed to parse Grok event");
+                            warn!(error = %e, "Failed to parse Grok event");
+                            trace!(raw = %text, "Grok event parse failure payload");
                         }
                     },
                     Ok(Message::Close(_)) => {

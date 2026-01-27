@@ -32,6 +32,19 @@ fn map_reqwest_error(label: &str, error: reqwest::Error) -> ModelError {
     ModelError::Transport(format!("{label} request failed: {error}"))
 }
 
+fn truncate_error_body(body: &str) -> String {
+    const LIMIT: usize = 2000;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().count() <= LIMIT {
+        return trimmed.to_string();
+    }
+    let truncated: String = trimmed.chars().take(LIMIT).collect();
+    format!("{truncated}...[truncated]")
+}
+
 fn join_path(base: &Url, path: &str) -> Result<Url, ModelError> {
     let mut url = base.clone();
     let base_path = url.path().trim_end_matches('/');
@@ -866,6 +879,12 @@ impl Model for OpenAIChatModel {
         settings: Option<&ModelSettings>,
         params: &ModelRequestParameters,
     ) -> Result<ModelResponse, ModelError> {
+        tracing::debug!(
+            model = %self.model,
+            tool_count = params.function_tools.len(),
+            output_schema = params.output_schema.is_some(),
+            "OpenAI chat request"
+        );
         let mut body = self.build_body(messages, params, false)?;
         if let Some(settings) = settings
             && let Value::Object(map) = &mut body
@@ -886,20 +905,27 @@ impl Model for OpenAIChatModel {
 
         let status = response.status();
         if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!(
+                status = status.as_u16(),
+                model = %self.model,
+                body = %truncate_error_body(&body),
+                "OpenAI chat request failed"
+            );
             return Err(ModelError::HttpStatus {
                 status: status.as_u16(),
             });
         }
 
-        let body: OpenAIChatResponse = response
-            .json()
-            .await
-            .map_err(|e| ModelError::Provider(format!("OpenAI response parse failed: {e}")))?;
+        let body: OpenAIChatResponse = response.json().await.map_err(|e| {
+            tracing::error!(error = %e, model = %self.model, "OpenAI response parse failed");
+            ModelError::Provider(format!("OpenAI response parse failed: {e}"))
+        })?;
 
-        let choice =
-            body.choices.into_iter().next().ok_or_else(|| {
-                ModelError::Provider("OpenAI response missing choices".to_string())
-            })?;
+        let choice = body.choices.into_iter().next().ok_or_else(|| {
+            tracing::error!(model = %self.model, "OpenAI response missing choices");
+            ModelError::Provider("OpenAI response missing choices".to_string())
+        })?;
 
         let mut parts = Vec::new();
         if let Some(content) = choice.message.content {
@@ -948,6 +974,12 @@ impl Model for OpenAIChatModel {
         settings: Option<&ModelSettings>,
         params: &ModelRequestParameters,
     ) -> Result<ModelStream, ModelError> {
+        tracing::debug!(
+            model = %self.model,
+            tool_count = params.function_tools.len(),
+            output_schema = params.output_schema.is_some(),
+            "OpenAI stream request"
+        );
         let mut body = self.build_body(messages, params, true)?;
         if let Some(settings) = settings
             && let Value::Object(map) = &mut body
@@ -966,18 +998,30 @@ impl Model for OpenAIChatModel {
             .await
             .map_err(|e| map_reqwest_error("OpenAI stream", e))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!(
+                status = status.as_u16(),
+                model = %self.model,
+                body = %truncate_error_body(&body),
+                "OpenAI stream request failed"
+            );
             return Err(ModelError::HttpStatus {
-                status: response.status().as_u16(),
+                status: status.as_u16(),
             });
         }
 
         let mut event_stream = response.bytes_stream().eventsource();
+        let model_name = self.model.clone();
 
         let s = try_stream! {
             let mut tool_accumulator: HashMap<String, ToolAccumulator> = HashMap::new();
             while let Some(event) = event_stream.next().await {
-                let event = event.map_err(|e| ModelError::Provider(format!("OpenAI stream error: {e}")))?;
+                let event = event.map_err(|e| {
+                    tracing::error!(error = %e, model = %model_name, "OpenAI stream error");
+                    ModelError::Provider(format!("OpenAI stream error: {e}"))
+                })?;
                 let data = event.data;
                 if data.trim() == "[DONE]" {
                     if !tool_accumulator.is_empty() {
@@ -1000,7 +1044,10 @@ impl Model for OpenAIChatModel {
                 }
 
                 let chunk: OpenAIChatStreamResponse = serde_json::from_str(&data)
-                    .map_err(|e| ModelError::Provider(format!("OpenAI stream parse error: {e}")))?;
+                    .map_err(|e| {
+                        tracing::error!(error = %e, model = %model_name, "OpenAI stream parse error");
+                        ModelError::Provider(format!("OpenAI stream parse error: {e}"))
+                    })?;
                 if let Some(choice) = chunk.choices.into_iter().next() {
                     if let Some(content) = choice.delta.content {
                         yield StreamChunk {
@@ -1512,6 +1559,12 @@ impl Model for OpenAIResponsesModel {
         settings: Option<&ModelSettings>,
         params: &ModelRequestParameters,
     ) -> Result<ModelResponse, ModelError> {
+        tracing::debug!(
+            model = %self.model,
+            tool_count = params.function_tools.len(),
+            output_schema = params.output_schema.is_some(),
+            "OpenAI responses request"
+        );
         let mut body = self.build_body(messages, params)?;
         if let Some(settings) = settings
             && let Value::Object(map) = &mut body
@@ -1536,15 +1589,26 @@ impl Model for OpenAIResponsesModel {
 
         let status = response.status();
         if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!(
+                status = status.as_u16(),
+                model = %self.model,
+                body = %truncate_error_body(&body),
+                "OpenAI responses request failed"
+            );
             return Err(ModelError::HttpStatus {
                 status: status.as_u16(),
             });
         }
 
-        let body: OpenAIResponsesResponse = response
-            .json()
-            .await
-            .map_err(|e| ModelError::Provider(format!("OpenAI response parse failed: {e}")))?;
+        let body: OpenAIResponsesResponse = response.json().await.map_err(|e| {
+            tracing::error!(
+                error = %e,
+                model = %self.model,
+                "OpenAI responses parse failed"
+            );
+            ModelError::Provider(format!("OpenAI response parse failed: {e}"))
+        })?;
 
         let mut parts = Vec::new();
         for item in body.output {

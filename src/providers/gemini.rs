@@ -25,6 +25,15 @@ fn map_reqwest_error(label: &str, error: reqwest::Error) -> ModelError {
     ModelError::Transport(format!("{label} request failed: {error}"))
 }
 
+fn truncate_error_body(body: &str) -> String {
+    const LIMIT: usize = 512;
+    if body.len() <= LIMIT {
+        body.to_string()
+    } else {
+        format!("{}... ({} bytes)", &body[..LIMIT], body.len())
+    }
+}
+
 fn normalize_tool_call_id(id: Option<String>) -> String {
     match id {
         Some(value) if !value.trim().is_empty() => value,
@@ -488,6 +497,12 @@ impl Model for GeminiModel {
         settings: Option<&ModelSettings>,
         params: &ModelRequestParameters,
     ) -> Result<ModelResponse, ModelError> {
+        tracing::debug!(
+            model = %self.model,
+            tool_count = params.function_tools.len(),
+            output_schema = params.output_schema.is_some(),
+            "Gemini request"
+        );
         let (system, contents) = Self::split_system(messages);
         let mut body = Map::new();
         body.insert("contents".to_string(), Value::Array(contents));
@@ -556,17 +571,29 @@ impl Model for GeminiModel {
 
         let status = response.status();
         if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!(
+                status = status.as_u16(),
+                model = %self.model,
+                body = %truncate_error_body(&body),
+                "Gemini request failed"
+            );
             return Err(ModelError::HttpStatus {
                 status: status.as_u16(),
             });
         }
 
-        let body: GeminiResponse = response
-            .json()
-            .await
-            .map_err(|e| ModelError::Provider(format!("Gemini response parse failed: {e}")))?;
+        let body: GeminiResponse = response.json().await.map_err(|e| {
+            tracing::error!(
+                error = %e,
+                model = %self.model,
+                "Gemini response parse failed"
+            );
+            ModelError::Provider(format!("Gemini response parse failed: {e}"))
+        })?;
 
         let candidate = body.candidates.into_iter().next().ok_or_else(|| {
+            tracing::error!(model = %self.model, "Gemini response missing candidates");
             ModelError::Provider("Gemini response missing candidates".to_string())
         })?;
 

@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::future::Future;
 
+use tracing::{debug, warn};
+
 use crate::model_config::{ModelConfigResolver, ResolvedModelConfig};
 
 use crate::error::AgentError;
@@ -166,10 +168,22 @@ where
                 let kind = classifier(&error);
                 last_kind = kind;
                 if !kind.is_some_and(|kind| config.failover_on.contains(kind)) {
+                    debug!(
+                        model = config.primary.as_str(),
+                        attempt = attempt + 1,
+                        error_kind = kind.unwrap_or(""),
+                        "primary request failed without failover"
+                    );
                     return Err(error);
                 }
                 last_error = Some(error);
                 if attempt < config.retry_limit {
+                    debug!(
+                        model = config.primary.as_str(),
+                        attempt = attempt + 1,
+                        error_kind = kind.unwrap_or(""),
+                        "primary request failed, retrying"
+                    );
                     continue;
                 }
                 break;
@@ -180,10 +194,21 @@ where
     let should_failover =
         config.backup.is_some() && last_kind.is_some_and(|kind| config.failover_on.contains(kind));
     if !should_failover && let Some(error) = last_error {
+        warn!(
+            model = config.primary.as_str(),
+            error_kind = last_kind.unwrap_or(""),
+            "primary request failed and no failover configured"
+        );
         return Err(error);
     }
 
     let backup = config.backup.clone().unwrap_or_default();
+    warn!(
+        primary = config.primary.as_str(),
+        backup = backup.as_str(),
+        error_kind = last_kind.unwrap_or(""),
+        "failing over to backup model"
+    );
     let result = invoke(&backup).await?;
     Ok(FailoverResult {
         value: result,

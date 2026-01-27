@@ -11,6 +11,8 @@ pub mod model;
 pub mod model_config;
 pub mod providers;
 pub mod realtime;
+#[cfg(any(feature = "telemetry-otel", feature = "telemetry-datadog"))]
+pub mod telemetry;
 pub mod tools;
 pub mod usage;
 

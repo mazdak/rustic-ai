@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -12,11 +12,14 @@ use jsonschema::{Draft, JSONSchema};
 use serde_json::Value;
 use tokio::time::timeout;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::error::AgentError;
 use crate::failover::{FailoverResult, classify_error_kind, run_with_config_and_classifier};
 use crate::instrumentation::{
-    Instrumenter, ModelRequestInfo, ModelResponseInfo, NoopInstrumenter, ToolCallInfo,
+    Instrumenter, ModelErrorInfo, ModelRequestInfo, ModelResponseInfo, NoopInstrumenter,
+    OutputValidationErrorInfo, RunEndInfo, RunErrorInfo, RunStartInfo, ToolCallInfo, ToolEndInfo,
+    ToolErrorInfo, ToolStartInfo, UsageLimitInfo, UsageLimitKind,
 };
 use crate::messages::{
     ModelMessage, ModelRequest, ModelRequestPart, ModelResponse, ModelResponsePart,
@@ -25,7 +28,7 @@ use crate::messages::{
 use crate::model::{Model, ModelRequestParameters, ModelSettings};
 use crate::model_config::{ModelConfigResolver, ResolvedModelConfig};
 use crate::tools::{RunContext, Tool, ToolDefinition, ToolError, ToolKind, Toolset};
-use crate::usage::{RunUsage, UsageLimits};
+use crate::usage::{RunUsage, UsageError, UsageLimits};
 
 pub type PrepareToolsFn<Deps> = Arc<
     dyn Fn(
@@ -60,6 +63,7 @@ where
             deps: Arc::new(input.deps),
             usage_limits: input.usage_limits,
             include_system_prompt: input.include_system_prompt,
+            run_id: resolve_run_id(input.run_id),
         }
     }
 
@@ -164,6 +168,7 @@ where
             deps,
             usage_limits,
             include_system_prompt,
+            run_id,
         } = prepared;
 
         let mut messages = Vec::new();
@@ -195,11 +200,13 @@ where
             .request_limit
             .map(|limit| limit.saturating_add(1).max(1))
             .unwrap_or(u64::MAX);
+        let run_started_at = Instant::now();
+        let model_name = model.name().to_string();
+        let mut run_started = false;
 
-        loop {
-            usage_limits.check_request(usage.requests)?;
-
+        let result = 'run: loop {
             let run_ctx = RunContext {
+                run_id: run_id.clone(),
                 deps: Arc::clone(&deps),
                 model: Arc::clone(&model),
                 usage: usage.clone(),
@@ -209,29 +216,75 @@ where
                 tool_name: None,
             };
 
-            let (tool_defs, tool_map) = self.collect_tools(&run_ctx).await?;
-            let (tool_defs, tool_map) = self
+            let (tool_defs, tool_map) = match self.collect_tools(&run_ctx).await {
+                Ok(result) => result,
+                Err(err) => break 'run Err(AgentError::Tool(err)),
+            };
+            let (tool_defs, tool_map) = match self
                 .apply_prepare_tools(&run_ctx, tool_defs, tool_map)
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                Err(err) => break 'run Err(AgentError::Tool(err)),
+            };
             let mut params = ModelRequestParameters::new(tool_defs);
             if let Some(schema) = &self.output_schema {
                 params = params.with_output_schema(schema.clone());
                 params.allow_text_output = self.allow_text_output;
             }
 
+            if !run_started {
+                self.instrumenter.on_run_start(&RunStartInfo {
+                    run_id: run_id.clone(),
+                    model_name: model_name.clone(),
+                    message_count: messages.len(),
+                    tool_count: params.function_tools.len(),
+                    output_schema: params.output_schema.is_some(),
+                    streaming: false,
+                    allow_text_output: self.allow_text_output,
+                    output_retries: self.output_retries,
+                    usage_limits: usage_limits.clone(),
+                });
+                run_started = true;
+            }
+
+            if let Err(err) = usage_limits.check_request(usage.requests) {
+                record_usage_limit(&self.instrumenter, &run_id, &model_name, &usage, &err);
+                break 'run Err(AgentError::Usage(err));
+            }
+
             self.instrumenter.on_model_request(&ModelRequestInfo {
-                model_name: model.name().to_string(),
+                run_id: run_id.clone(),
+                model_name: model_name.clone(),
+                step,
                 message_count: messages.len(),
                 tool_count: params.function_tools.len(),
                 output_schema: params.output_schema.is_some(),
+                streaming: false,
+                allow_text_output: self.allow_text_output,
             });
 
             let response_settings = settings_override.as_ref().or(self.model_settings.as_ref());
-
-            let mut response = model.request(&messages, response_settings, &params).await?;
+            let request_started = Instant::now();
+            let mut response = match model.request(&messages, response_settings, &params).await {
+                Ok(response) => response,
+                Err(err) => {
+                    self.instrumenter.on_model_error(&ModelErrorInfo {
+                        run_id: run_id.clone(),
+                        model_name: model_name.clone(),
+                        step,
+                        error: err.to_string(),
+                        error_kind: classify_error_kind(&err as &dyn std::error::Error)
+                            .map(str::to_string),
+                        duration: request_started.elapsed(),
+                        streaming: false,
+                    });
+                    break 'run Err(AgentError::Model(err));
+                }
+            };
 
             if response.model_name.is_none() {
-                response.model_name = Some(model.name().to_string());
+                response.model_name = Some(model_name.clone());
             }
 
             if let Some(request_usage) = &response.usage {
@@ -240,14 +293,23 @@ where
                 usage.requests += 1;
             }
 
-            usage_limits.check_after_response(&usage)?;
+            if let Err(err) = usage_limits.check_after_response(&usage) {
+                record_usage_limit(&self.instrumenter, &run_id, &model_name, &usage, &err);
+                break 'run Err(AgentError::Usage(err));
+            }
             messages.push(ModelMessage::Response(response.clone()));
 
+            let output_len = response.text().map(|text| text.len()).unwrap_or(0);
             self.instrumenter.on_model_response(&ModelResponseInfo {
-                model_name: model.name().to_string(),
+                run_id: run_id.clone(),
+                model_name: model_name.clone(),
+                step,
                 finish_reason: response.finish_reason.clone(),
                 usage: usage.clone(),
                 tool_calls: response.tool_calls().len(),
+                output_len,
+                duration: request_started.elapsed(),
+                streaming: false,
             });
 
             let tool_calls = response.tool_calls();
@@ -272,13 +334,21 @@ where
                                     }));
                                     continue;
                                 }
-                                return Err(AgentError::OutputValidation(err));
+                                self.instrumenter.on_output_validation_error(
+                                    &OutputValidationErrorInfo {
+                                        run_id: run_id.clone(),
+                                        model_name: model_name.clone(),
+                                        error: err.clone(),
+                                        output_len: output.len(),
+                                    },
+                                );
+                                break 'run Err(AgentError::OutputValidation(err));
                             }
                         }
                     }
                     None => None,
                 };
-                return Ok(AgentRunResult {
+                break 'run Ok(AgentRunResult {
                     output,
                     usage,
                     messages,
@@ -292,11 +362,25 @@ where
             let mut deferred_calls = Vec::new();
             let mut executable_calls: Vec<(usize, ToolCallPart, ToolEntry<Deps>)> = Vec::new();
             for (index, call) in tool_calls.into_iter().enumerate() {
-                usage_limits.check_tool_call(usage.tool_calls)?;
+                if let Err(err) = usage_limits.check_tool_call(usage.tool_calls) {
+                    record_usage_limit(&self.instrumenter, &run_id, &model_name, &usage, &err);
+                    break 'run Err(AgentError::Usage(err));
+                }
                 usage.incr_tool_call();
-                let entry = tool_map
-                    .get(&call.name)
-                    .ok_or_else(|| AgentError::UnknownTool(call.name.clone()))?;
+                let entry = match tool_map.get(&call.name) {
+                    Some(entry) => entry,
+                    None => {
+                        let err = AgentError::UnknownTool(call.name.clone());
+                        self.instrumenter.on_tool_error(&ToolErrorInfo {
+                            run_id: run_id.clone(),
+                            tool_name: call.name.clone(),
+                            tool_call_id: Some(call.id.clone()),
+                            error: err.to_string(),
+                            duration: Duration::from_millis(0),
+                        });
+                        break 'run Err(err);
+                    }
+                };
 
                 let is_deferred = matches!(
                     entry.definition.kind,
@@ -304,9 +388,12 @@ where
                 );
 
                 self.instrumenter.on_tool_call(&ToolCallInfo {
+                    run_id: run_id.clone(),
                     tool_name: call.name.clone(),
                     tool_call_id: Some(call.id.clone()),
                     deferred: is_deferred,
+                    kind: entry.definition.kind.clone(),
+                    sequential: entry.definition.sequential,
                 });
 
                 if is_deferred {
@@ -328,6 +415,7 @@ where
             if should_run_sequentially {
                 for (index, call, entry) in executable_calls {
                     let tool_ctx = RunContext {
+                        run_id: run_id.clone(),
                         deps: Arc::clone(&deps),
                         model: Arc::clone(&model),
                         usage: usage.clone(),
@@ -336,9 +424,13 @@ where
                         tool_call_id: None,
                         tool_name: None,
                     };
-                    let tool_result = self
+                    let tool_result = match self
                         .execute_tool_with_timeout(&tool_ctx, &entry, &call)
-                        .await?;
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => break 'run Err(err),
+                    };
                     tool_results.push((
                         index,
                         ToolReturnPart {
@@ -352,6 +444,7 @@ where
                 let mut futures = Vec::new();
                 for (index, call, entry) in executable_calls {
                     let tool_ctx = RunContext {
+                        run_id: run_id.clone(),
                         deps: Arc::clone(&deps),
                         model: Arc::clone(&model),
                         usage: usage.clone(),
@@ -370,7 +463,10 @@ where
                     });
                 }
                 for (index, call, result) in join_all(futures).await {
-                    let tool_result = result?;
+                    let tool_result = match result {
+                        Ok(result) => result,
+                        Err(err) => break 'run Err(err),
+                    };
                     tool_results.push((
                         index,
                         ToolReturnPart {
@@ -391,7 +487,7 @@ where
             }
 
             if !deferred_calls.is_empty() {
-                return Ok(AgentRunResult {
+                break 'run Ok(AgentRunResult {
                     output: String::new(),
                     usage,
                     messages,
@@ -404,9 +500,37 @@ where
 
             step += 1;
             if step >= max_steps {
-                return Err(AgentError::Config(
+                break 'run Err(AgentError::Config(
                     "tool execution loop exceeded request limit".to_string(),
                 ));
+            }
+        };
+
+        match result {
+            Ok(result) => {
+                self.instrumenter.on_run_end(&RunEndInfo {
+                    run_id: run_id.clone(),
+                    model_name: model_name.clone(),
+                    state: result.state.clone(),
+                    usage: result.usage.clone(),
+                    output_len: result.output.len(),
+                    deferred_calls: result.deferred_calls.len(),
+                    tool_calls: result.usage.tool_calls as usize,
+                    duration: run_started_at.elapsed(),
+                });
+                Ok(result)
+            }
+            Err(err) => {
+                self.instrumenter.on_run_error(&RunErrorInfo {
+                    run_id: run_id.clone(),
+                    model_name: model_name.clone(),
+                    error: err.to_string(),
+                    error_kind: classify_error_kind(&err as &dyn std::error::Error)
+                        .map(str::to_string),
+                    streaming: false,
+                    duration: run_started_at.elapsed(),
+                });
+                Err(err)
             }
         }
     }
@@ -494,11 +618,15 @@ where
             deps,
             usage_limits,
             include_system_prompt,
+            run_id,
         } = input;
 
         let deps = Arc::new(deps);
         let mut messages = Vec::new();
         let output_instructions = self.output_schema.as_ref().map(build_output_instructions);
+        let run_id = resolve_run_id(run_id);
+        let run_started_at = Instant::now();
+        let model_name = self.model.name().to_string();
 
         if include_system_prompt && let Some(prompt) = &self.system_prompt {
             messages.push(ModelMessage::Request(ModelRequest {
@@ -520,6 +648,7 @@ where
         }));
 
         let run_ctx = RunContext {
+            run_id: run_id.clone(),
             deps: Arc::clone(&deps),
             model: Arc::clone(&self.model),
             usage: RunUsage::default(),
@@ -529,10 +658,41 @@ where
             tool_name: None,
         };
 
-        let (tool_defs, tool_map) = self.collect_tools(&run_ctx).await?;
-        let (tool_defs, tool_map) = self
+        let (tool_defs, tool_map) = match self.collect_tools(&run_ctx).await {
+            Ok(result) => result,
+            Err(err) => {
+                let agent_err = AgentError::Tool(err);
+                self.instrumenter.on_run_error(&RunErrorInfo {
+                    run_id: run_id.clone(),
+                    model_name: model_name.clone(),
+                    error: agent_err.to_string(),
+                    error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
+                        .map(str::to_string),
+                    streaming: true,
+                    duration: run_started_at.elapsed(),
+                });
+                return Err(agent_err);
+            }
+        };
+        let (tool_defs, tool_map) = match self
             .apply_prepare_tools(&run_ctx, tool_defs, tool_map)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let agent_err = AgentError::Tool(err);
+                self.instrumenter.on_run_error(&RunErrorInfo {
+                    run_id: run_id.clone(),
+                    model_name: model_name.clone(),
+                    error: agent_err.to_string(),
+                    error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
+                        .map(str::to_string),
+                    streaming: true,
+                    duration: run_started_at.elapsed(),
+                });
+                return Err(agent_err);
+            }
+        };
 
         let mut params = ModelRequestParameters::new(tool_defs);
         if let Some(schema) = &self.output_schema {
@@ -540,25 +700,92 @@ where
             params.allow_text_output = self.allow_text_output;
         }
 
-        usage_limits.check_request(0)?;
-
-        self.instrumenter.on_model_request(&ModelRequestInfo {
-            model_name: self.model.name().to_string(),
+        self.instrumenter.on_run_start(&RunStartInfo {
+            run_id: run_id.clone(),
+            model_name: model_name.clone(),
             message_count: messages.len(),
             tool_count: params.function_tools.len(),
             output_schema: params.output_schema.is_some(),
+            streaming: true,
+            allow_text_output: self.allow_text_output,
+            output_retries: self.output_retries,
+            usage_limits: usage_limits.clone(),
+        });
+
+        if let Err(err) = usage_limits.check_request(0) {
+            record_usage_limit(
+                &self.instrumenter,
+                &run_id,
+                &model_name,
+                &RunUsage::default(),
+                &err,
+            );
+            let agent_err = AgentError::Usage(err);
+            self.instrumenter.on_run_error(&RunErrorInfo {
+                run_id: run_id.clone(),
+                model_name: model_name.clone(),
+                error: agent_err.to_string(),
+                error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
+                    .map(str::to_string),
+                streaming: true,
+                duration: run_started_at.elapsed(),
+            });
+            return Err(agent_err);
+        }
+
+        self.instrumenter.on_model_request(&ModelRequestInfo {
+            run_id: run_id.clone(),
+            model_name: model_name.clone(),
+            step: 0,
+            message_count: messages.len(),
+            tool_count: params.function_tools.len(),
+            output_schema: params.output_schema.is_some(),
+            streaming: true,
+            allow_text_output: self.allow_text_output,
         });
 
         let response_settings = self.model_settings.as_ref();
-        let stream = self
+        let request_started = Instant::now();
+        let stream = match self
             .model
             .request_stream(&messages, response_settings, &params)
-            .await?;
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                self.instrumenter.on_model_error(&ModelErrorInfo {
+                    run_id: run_id.clone(),
+                    model_name: model_name.clone(),
+                    step: 0,
+                    error: err.to_string(),
+                    error_kind: classify_error_kind(&err as &dyn std::error::Error)
+                        .map(str::to_string),
+                    duration: request_started.elapsed(),
+                    streaming: true,
+                });
+                let agent_err = AgentError::Model(err);
+                self.instrumenter.on_run_error(&RunErrorInfo {
+                    run_id: run_id.clone(),
+                    model_name: model_name.clone(),
+                    error: agent_err.to_string(),
+                    error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
+                        .map(str::to_string),
+                    streaming: true,
+                    duration: run_started_at.elapsed(),
+                });
+                return Err(agent_err);
+            }
+        };
 
         let instrumenter = Arc::clone(&self.instrumenter);
-        let model_name = self.model.name().to_string();
         let output_schema = self.output_schema.clone();
         let allow_text_output = self.allow_text_output;
+        let run_id_for_stream = run_id.clone();
+        let model_name_for_stream = model_name.clone();
+        let run_started_at_for_stream = run_started_at;
+        let request_started_for_stream = request_started;
+        let usage_limits_for_stream = usage_limits.clone();
+        let tool_map_for_stream = tool_map;
 
         let s = try_stream! {
             let mut usage = RunUsage::default();
@@ -569,14 +796,75 @@ where
 
             let mut stream = stream;
             while let Some(chunk) = stream.as_mut().next().await {
-                let chunk = chunk?;
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        instrumenter.on_model_error(&ModelErrorInfo {
+                            run_id: run_id_for_stream.clone(),
+                            model_name: model_name_for_stream.clone(),
+                            step: 0,
+                            error: err.to_string(),
+                            error_kind: classify_error_kind(&err as &dyn std::error::Error)
+                                .map(str::to_string),
+                            duration: request_started_for_stream.elapsed(),
+                            streaming: true,
+                        });
+                        let agent_err = AgentError::Model(err);
+                        instrumenter.on_run_error(&RunErrorInfo {
+                            run_id: run_id_for_stream.clone(),
+                            model_name: model_name_for_stream.clone(),
+                            error: agent_err.to_string(),
+                            error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
+                                .map(str::to_string),
+                            streaming: true,
+                            duration: run_started_at_for_stream.elapsed(),
+                        });
+                        Err(agent_err)?
+                    }
+                };
                 if let Some(delta) = chunk.text_delta {
                     output_text.push_str(&delta);
                     yield AgentStreamEvent::TextDelta(delta);
                 }
                 if let Some(call) = chunk.tool_call {
-                    usage_limits.check_tool_call(usage.tool_calls)?;
+                    if let Err(err) = usage_limits_for_stream.check_tool_call(usage.tool_calls) {
+                        record_usage_limit(
+                            &instrumenter,
+                            &run_id_for_stream,
+                            &model_name_for_stream,
+                            &usage,
+                            &err,
+                        );
+                        let agent_err = AgentError::Usage(err);
+                        instrumenter.on_run_error(&RunErrorInfo {
+                            run_id: run_id_for_stream.clone(),
+                            model_name: model_name_for_stream.clone(),
+                            error: agent_err.to_string(),
+                            error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
+                                .map(str::to_string),
+                            streaming: true,
+                            duration: run_started_at_for_stream.elapsed(),
+                        });
+                        Err(agent_err)?;
+                    }
                     usage.incr_tool_call();
+                    let kind = tool_map_for_stream
+                        .get(&call.name)
+                        .map(|entry| entry.definition.kind.clone())
+                        .unwrap_or(ToolKind::Function);
+                    let sequential = tool_map_for_stream
+                        .get(&call.name)
+                        .map(|entry| entry.definition.sequential)
+                        .unwrap_or(false);
+                    let deferred = matches!(kind, ToolKind::External | ToolKind::Unapproved);
+                    instrumenter.on_tool_call(&ToolCallInfo {
+                        run_id: run_id_for_stream.clone(),
+                        tool_name: call.name.clone(),
+                        tool_call_id: Some(call.id.clone()),
+                        deferred,
+                        kind,
+                        sequential,
+                    });
                     tool_calls.push(call.clone());
                     yield AgentStreamEvent::ToolCall(call);
                 }
@@ -587,7 +875,26 @@ where
                     saw_usage = true;
                     usage.incr_request(&req_usage);
                 }
-                usage_limits.check_after_response(&usage)?;
+                if let Err(err) = usage_limits_for_stream.check_after_response(&usage) {
+                    record_usage_limit(
+                        &instrumenter,
+                        &run_id_for_stream,
+                        &model_name_for_stream,
+                        &usage,
+                        &err,
+                    );
+                    let agent_err = AgentError::Usage(err);
+                    instrumenter.on_run_error(&RunErrorInfo {
+                        run_id: run_id_for_stream.clone(),
+                        model_name: model_name_for_stream.clone(),
+                        error: agent_err.to_string(),
+                        error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
+                            .map(str::to_string),
+                        streaming: true,
+                        duration: run_started_at_for_stream.elapsed(),
+                    });
+                    Err(agent_err)?;
+                }
             }
 
             if !saw_usage {
@@ -613,15 +920,20 @@ where
             messages.push(ModelMessage::Response(response.clone()));
 
             instrumenter.on_model_response(&ModelResponseInfo {
-                model_name: model_name.clone(),
+                run_id: run_id_for_stream.clone(),
+                model_name: model_name_for_stream.clone(),
+                step: 0,
                 finish_reason: response.finish_reason.clone(),
                 usage: usage.clone(),
                 tool_calls: tool_calls.len(),
+                output_len: output_text.len(),
+                duration: request_started_for_stream.elapsed(),
+                streaming: true,
             });
 
             let mut deferred_calls = Vec::new();
             for call in tool_calls {
-                let kind = tool_map
+                let kind = tool_map_for_stream
                     .get(&call.name)
                     .map(|entry| entry.definition.kind.clone())
                     .unwrap_or(ToolKind::Function);
@@ -634,8 +946,28 @@ where
             }
 
             let parsed_output = match output_schema.as_ref() {
-                Some(schema) => validate_output(schema, &output_text, allow_text_output)
-                    .map_err(AgentError::OutputValidation)?,
+                Some(schema) => match validate_output(schema, &output_text, allow_text_output) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        instrumenter.on_output_validation_error(&OutputValidationErrorInfo {
+                            run_id: run_id_for_stream.clone(),
+                            model_name: model_name_for_stream.clone(),
+                            error: err.clone(),
+                            output_len: output_text.len(),
+                        });
+                        let agent_err = AgentError::OutputValidation(err);
+                        instrumenter.on_run_error(&RunErrorInfo {
+                            run_id: run_id_for_stream.clone(),
+                            model_name: model_name_for_stream.clone(),
+                            error: agent_err.to_string(),
+                            error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
+                                .map(str::to_string),
+                            streaming: true,
+                            duration: run_started_at_for_stream.elapsed(),
+                        });
+                        Err(agent_err)?
+                    }
+                },
                 None => None,
             };
 
@@ -645,7 +977,7 @@ where
                 AgentRunState::Deferred
             };
 
-            yield AgentStreamEvent::Done(Box::new(AgentRunResult {
+            let result = AgentRunResult {
                 output: output_text,
                 usage,
                 messages,
@@ -653,7 +985,20 @@ where
                 parsed_output,
                 deferred_calls,
                 state,
-            }));
+            };
+
+            instrumenter.on_run_end(&RunEndInfo {
+                run_id: run_id_for_stream.clone(),
+                model_name: model_name_for_stream.clone(),
+                state: result.state.clone(),
+                usage: result.usage.clone(),
+                output_len: result.output.len(),
+                deferred_calls: result.deferred_calls.len(),
+                tool_calls: result.usage.tool_calls as usize,
+                duration: run_started_at_for_stream.elapsed(),
+            });
+
+            yield AgentStreamEvent::Done(Box::new(result));
         };
 
         Ok(Box::pin(s))
@@ -741,7 +1086,16 @@ where
         entry: &ToolEntry<Deps>,
         call: &ToolCallPart,
     ) -> Result<serde_json::Value, AgentError> {
-        if let Some(timeout_secs) = entry.definition.timeout {
+        let started_at = Instant::now();
+        self.instrumenter.on_tool_start(&ToolStartInfo {
+            run_id: ctx.run_id.clone(),
+            tool_name: call.name.clone(),
+            tool_call_id: Some(call.id.clone()),
+            timeout_secs: entry.definition.timeout,
+            sequential: entry.definition.sequential,
+        });
+
+        let result = if let Some(timeout_secs) = entry.definition.timeout {
             let duration = Duration::from_secs_f64(timeout_secs.max(0.0));
             match timeout(duration, self.execute_tool(ctx, entry, call)).await {
                 Ok(result) => result,
@@ -751,6 +1105,28 @@ where
             }
         } else {
             self.execute_tool(ctx, entry, call).await
+        };
+
+        match result {
+            Ok(value) => {
+                self.instrumenter.on_tool_end(&ToolEndInfo {
+                    run_id: ctx.run_id.clone(),
+                    tool_name: call.name.clone(),
+                    tool_call_id: Some(call.id.clone()),
+                    duration: started_at.elapsed(),
+                });
+                Ok(value)
+            }
+            Err(err) => {
+                self.instrumenter.on_tool_error(&ToolErrorInfo {
+                    run_id: ctx.run_id.clone(),
+                    tool_name: call.name.clone(),
+                    tool_call_id: Some(call.id.clone()),
+                    error: err.to_string(),
+                    duration: started_at.elapsed(),
+                });
+                Err(err)
+            }
         }
     }
 }
@@ -797,6 +1173,37 @@ fn validate_output(
     Ok(Some(parsed))
 }
 
+fn resolve_run_id(run_id: Option<String>) -> String {
+    match run_id {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => Uuid::new_v4().to_string(),
+    }
+}
+
+fn record_usage_limit(
+    instrumenter: &Arc<dyn Instrumenter>,
+    run_id: &str,
+    model_name: &str,
+    usage: &RunUsage,
+    err: &UsageError,
+) {
+    let (kind, limit) = match *err {
+        UsageError::RequestLimitExceeded { limit } => (UsageLimitKind::Requests, limit),
+        UsageError::ToolCallsLimitExceeded { limit } => (UsageLimitKind::ToolCalls, limit),
+        UsageError::InputTokensLimitExceeded { limit } => (UsageLimitKind::InputTokens, limit),
+        UsageError::OutputTokensLimitExceeded { limit } => (UsageLimitKind::OutputTokens, limit),
+        UsageError::TotalTokensLimitExceeded { limit } => (UsageLimitKind::TotalTokens, limit),
+    };
+
+    instrumenter.on_usage_limit(&UsageLimitInfo {
+        run_id: run_id.to_string(),
+        model_name: model_name.to_string(),
+        kind,
+        limit,
+        usage: usage.clone(),
+    });
+}
+
 struct ToolEntry<Deps> {
     definition: ToolDefinition,
     executor: ToolExecutor<Deps>,
@@ -831,6 +1238,7 @@ pub struct RunInput<Deps> {
     pub deps: Deps,
     pub usage_limits: UsageLimits,
     pub include_system_prompt: bool,
+    pub run_id: Option<String>,
 }
 
 struct PreparedRunInput<Deps> {
@@ -839,6 +1247,7 @@ struct PreparedRunInput<Deps> {
     deps: Arc<Deps>,
     usage_limits: UsageLimits,
     include_system_prompt: bool,
+    run_id: String,
 }
 
 impl<Deps> Clone for PreparedRunInput<Deps> {
@@ -849,6 +1258,7 @@ impl<Deps> Clone for PreparedRunInput<Deps> {
             deps: Arc::clone(&self.deps),
             usage_limits: self.usage_limits.clone(),
             include_system_prompt: self.include_system_prompt,
+            run_id: self.run_id.clone(),
         }
     }
 }
@@ -866,7 +1276,13 @@ impl<Deps> RunInput<Deps> {
             deps,
             usage_limits,
             include_system_prompt: true,
+            run_id: None,
         }
+    }
+
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
     }
 }
 

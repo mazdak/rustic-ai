@@ -13,7 +13,7 @@ and tool calling ergonomic.
 - **Deferred tools** for approval flows and external tooling
 - **Tool execution controls** (timeouts + sequential execution)
 - **MCP toolsets** (HTTP + SSE extras)
-- **Instrumentation hooks** (Tracing/OTEL-compatible telemetry)
+- **Instrumentation hooks** (Tracing/OTEL-ready, optional OTLP/Datadog helpers)
 - **Configurable failover** with pluggable resolvers
 - **Realtime Grok helpers** for voice agents (audio + tool calls)
 
@@ -29,6 +29,25 @@ and tool calling ergonomic.
 ```toml
 [dependencies]
 rustic-ai = { path = "../rustic-ai" }
+```
+
+## Telemetry (optional)
+
+Enable OTLP or Datadog helpers with feature flags:
+
+```toml
+[dependencies]
+rustic-ai = { path = "../rustic-ai", features = ["telemetry-otel"] }
+# or: features = ["telemetry-datadog"]
+```
+
+Example (OTLP):
+
+```rust
+use opentelemetry_otlp::Protocol;
+use rustic_ai::telemetry::init_otlp_tracing;
+
+let _guard = init_otlp_tracing("rustic-ai", Protocol::Grpc, None, None)?;
 ```
 
 ## Canonical example
