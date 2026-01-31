@@ -1,65 +1,70 @@
 # RusticAI
 
-RusticAI is a Rust-native agent framework inspired by PydanticAI. It focuses on
-clear abstractions, memory safety, and performance while keeping agent orchestration
+[![Crates.io](https://img.shields.io/crates/v/rustic-ai.svg)](https://crates.io/crates/rustic-ai)
+[![Documentation](https://docs.rs/rustic-ai/badge.svg)](https://docs.rs/rustic-ai)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+A Rust-native agent framework inspired by PydanticAI. RusticAI focuses on clear
+abstractions, memory safety, and performance while keeping agent orchestration
 and tool calling ergonomic.
 
-## Highlights
+## Features
 
 - **Agent orchestration** with tool calling, usage limits, and message history
-- **Providers** for OpenAI, Gemini, Anthropic, and Grok (XAI)
-- **Streaming** support with structured events
-- **Structured output** validation (JSON schema, strict by default)
-- **Deferred tools** for approval flows and external tooling
-- **Tool execution controls** (timeouts + sequential execution)
-- **MCP toolsets** (HTTP + SSE extras)
-- **Instrumentation hooks** (Tracing/OTEL-ready, optional OTLP/Datadog helpers)
-- **Configurable failover** with pluggable resolvers
-- **Realtime Grok helpers** for voice agents (audio + tool calls)
+- **Multi-provider support** for OpenAI, Gemini, Anthropic, and Grok (XAI)
+- **Streaming** with structured events (text deltas, tool calls)
+- **Structured output** validation via JSON schema
+- **Deferred tools** for approval flows and human-in-the-loop workflows
+- **Tool execution controls** including timeouts and sequential execution
+- **MCP toolsets** for remote tool integration (HTTP + SSE)
+- **Instrumentation hooks** with tracing/OpenTelemetry support
+- **Configurable failover** with pluggable model resolvers
+- **Realtime support** for Grok voice agents (audio + tool calls)
 
-## Provider notes
+## Installation
 
-- OpenAI defaults to the Responses API; audio inputs and streaming fall back to Chat Completions when supported by the model.
-- Grok uses the OpenAI-compatible Chat Completions API for tool calling.
-- Structured output schemas are normalized for OpenAI-compatible strict mode where supported.
-- Grok vision expects image URLs; binary image inputs are rejected.
-
-## Install
+Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustic-ai = { path = "../rustic-ai" }
+rustic-ai = "0.1"
 ```
 
-## Telemetry (optional)
-
-Enable OTLP or Datadog helpers with feature flags:
-
-```toml
-[dependencies]
-rustic-ai = { path = "../rustic-ai", features = ["telemetry-otel"] }
-# or: features = ["telemetry-datadog"]
-```
-
-Example (OTLP):
+## Quick Start
 
 ```rust
-use opentelemetry_otlp::Protocol;
-use rustic_ai::telemetry::init_otlp_tracing;
+use rustic_ai::{Agent, RunInput, UsageLimits, UserContent, infer_model, infer_provider};
 
-let _guard = init_otlp_tracing("rustic-ai", Protocol::Grpc, None, None)?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a model (requires OPENAI_API_KEY environment variable)
+    let model = infer_model("openai:gpt-4o-mini", infer_provider)?;
+
+    // Build an agent with a system prompt
+    let agent = Agent::new(model)
+        .system_prompt("You are a helpful assistant.");
+
+    // Run the agent
+    let input = RunInput::new(
+        vec![UserContent::Text("What is the capital of France?".to_string())],
+        vec![],
+        (),
+        UsageLimits::default(),
+    );
+
+    let result = agent.run(input).await?;
+    println!("{}", result.output);
+
+    Ok(())
+}
 ```
 
-## Canonical example
+## Adding Tools
+
+Tools are defined with typed arguments using `serde` and `schemars`:
 
 ```rust
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use rustic_ai::{
-    Agent, FunctionTool, Model, ModelMessage, ModelRequestParameters, ModelResponse,
-    ModelResponsePart, RunInput, UsageLimits, UserContent,
-};
+use rustic_ai::FunctionTool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -74,53 +79,74 @@ struct AddResult {
     sum: i64,
 }
 
-struct EchoModel;
+let tool = FunctionTool::new("add", "Add two numbers", |_ctx, args: AddArgs| async move {
+    Ok(AddResult { sum: args.a + args.b })
+})?;
 
-#[async_trait]
-impl Model for EchoModel {
-    fn name(&self) -> &str {
-        "echo"
+let mut agent = Agent::new(model).system_prompt("You can do math.");
+agent.tool(tool);
+```
+
+## Providers
+
+RusticAI supports multiple LLM providers:
+
+| Provider | Environment Variable | Example Model |
+|----------|---------------------|---------------|
+| OpenAI | `OPENAI_API_KEY` | `openai:gpt-4o-mini` |
+| Anthropic | `ANTHROPIC_API_KEY` | `anthropic:claude-sonnet-4-5` |
+| Gemini | `GEMINI_API_KEY` | `gemini:gemini-2.0-flash` |
+| Grok | `XAI_API_KEY` | `grok:grok-3-mini-fast` |
+
+```rust
+// Use any supported provider
+let openai = infer_model("openai:gpt-4o", infer_provider)?;
+let anthropic = infer_model("anthropic:claude-sonnet-4-5", infer_provider)?;
+let gemini = infer_model("gemini:gemini-2.0-flash", infer_provider)?;
+let grok = infer_model("grok:grok-3-mini-fast", infer_provider)?;
+```
+
+## Streaming
+
+Stream responses with text deltas and tool call events:
+
+```rust
+use futures::StreamExt;
+use rustic_ai::agent::AgentStreamEvent;
+
+let mut stream = agent.run_stream(input).await?;
+
+while let Some(event) = stream.next().await {
+    match event? {
+        AgentStreamEvent::TextDelta(text) => print!("{text}"),
+        AgentStreamEvent::ToolCall(call) => println!("\n[Tool: {}]", call.name),
+        AgentStreamEvent::Done(result) => println!("\n\nDone: {}", result.output),
     }
-
-    async fn request(
-        &self,
-        _messages: &[ModelMessage],
-        _settings: Option<&rustic_ai::ModelSettings>,
-        _params: &ModelRequestParameters,
-    ) -> Result<ModelResponse, rustic_ai::model::ModelError> {
-        Ok(ModelResponse {
-            parts: vec![ModelResponsePart::Text(rustic_ai::TextPart {
-                content: "hello".to_string(),
-            })],
-            usage: None,
-            model_name: Some("echo".to_string()),
-            finish_reason: Some("stop".to_string()),
-        })
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    let model = Arc::new(EchoModel);
-    let mut agent = Agent::new(model).system_prompt("You are helpful.");
-
-    let tool = FunctionTool::new("add", "add two numbers", |_, args: AddArgs| async move {
-        Ok(AddResult { sum: args.a + args.b })
-    })
-    .expect("tool creation should succeed");
-
-    agent.tool(tool);
-
-    let input = RunInput::new(
-        vec![UserContent::Text("hello".to_string())],
-        vec![],
-        (),
-        UsageLimits::default(),
-    );
-
-    let result = agent.run(input).await.expect("run succeeds");
-    println!("{}", result.output);
 }
 ```
 
-For detailed developer documentation, see `DEVELOPMENT.md`.
+## Telemetry (Optional)
+
+Enable OpenTelemetry or Datadog exporters with feature flags:
+
+```toml
+[dependencies]
+rustic-ai = { version = "0.1", features = ["telemetry-otel"] }
+# or: features = ["telemetry-datadog"]
+```
+
+```rust
+use opentelemetry_otlp::Protocol;
+use rustic_ai::telemetry::init_otlp_tracing;
+
+let _guard = init_otlp_tracing("my-service", Protocol::Grpc, None, None)?;
+```
+
+## Documentation
+
+- [API Documentation](https://docs.rs/rustic-ai) - Full API reference
+- [Development Guide](DEVELOPMENT.md) - Architecture, internals, and contributor guide
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.

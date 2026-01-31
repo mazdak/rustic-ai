@@ -2,6 +2,13 @@
 name = "rustic-ai"
 version = "0.1.0"
 edition = "2024"
+authors = ["Mazdak Rezvani"]
+description = "A Rust-native agent framework with tool calling, streaming, and multi-provider support for OpenAI, Anthropic, Gemini, and Grok"
+license = "MIT"
+repository = "https://github.com/mazdak/rustic-ai"
+readme = "README.md"
+keywords = ["agent", "llm", "ai", "openai", "anthropic"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 async-trait = "0.1.77"

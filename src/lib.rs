@@ -1,3 +1,46 @@
+//! # RusticAI
+//!
+//! A Rust-native agent framework with tool calling, streaming, and multi-provider
+//! support for OpenAI, Anthropic, Gemini, and Grok.
+//!
+//! ## Quick Start
+//!
+//! ```rust,no_run
+//! use rustic_ai::{Agent, RunInput, UsageLimits, UserContent, infer_model, infer_provider};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let model = infer_model("openai:gpt-4o-mini", infer_provider)?;
+//! let agent = Agent::new(model)
+//!     .system_prompt("You are a helpful assistant.");
+//!
+//! let input = RunInput::new(
+//!     vec![UserContent::Text("Hello!".to_string())],
+//!     vec![],
+//!     (),
+//!     UsageLimits::default(),
+//! );
+//!
+//! let result = agent.run(input).await?;
+//! println!("{}", result.output);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Features
+//!
+//! - **Agent orchestration** with tool calling, usage limits, and message history
+//! - **Multi-provider support** for OpenAI, Gemini, Anthropic, and Grok
+//! - **Streaming** with structured events
+//! - **Structured output** validation via JSON schema
+//! - **Deferred tools** for approval flows
+//! - **MCP toolsets** for remote tool integration
+//! - **Instrumentation hooks** with tracing/OpenTelemetry support
+//!
+//! ## Optional Features
+//!
+//! - `telemetry-otel` - OpenTelemetry/OTLP exporter support
+//! - `telemetry-datadog` - Datadog exporter support
+
 #![forbid(unsafe_code)]
 
 pub mod agent;
