@@ -5,9 +5,7 @@ use std::io::{IsTerminal, Write};
 
 use clap::Parser;
 use rustic_ai::mcp::McpServerStreamableHttp;
-use rustic_ai::{
-    Agent, ModelMessage, RunInput, UsageLimits, UserContent, infer_model, infer_provider,
-};
+use rustic_ai::{Agent, ModelMessage, RunInput, UsageLimits, infer_model, infer_provider};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 const DEFAULT_PROMPT: &str = "I am patient P123. Book me with dr_smith on 2026-01-23 at 09:30 for a checkup. My phone is 555-0100.";
@@ -58,12 +56,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         run_interactive(&agent, deps, prompt).await?;
     } else {
         let prompt = resolve_noninteractive(prompt).await?;
-        let input = RunInput::new(
-            vec![UserContent::Text(prompt)],
-            vec![],
-            deps,
-            UsageLimits::default(),
-        );
+        let input = RunInput::builder(deps)
+            .user_text(prompt)
+            .usage_limits(UsageLimits::default())
+            .build();
         let result = agent.run_with_toolsets(input).await?;
         println!("{}", result.output);
     }
@@ -133,15 +129,12 @@ async fn run_interactive(
             break;
         }
 
-        let mut input = RunInput::new(
-            vec![UserContent::Text(user_text)],
-            message_history,
-            deps.clone(),
-            UsageLimits::default(),
-        );
-        if !first {
-            input.include_system_prompt = false;
-        }
+        let input = RunInput::builder(deps.clone())
+            .user_text(user_text)
+            .message_history(message_history)
+            .usage_limits(UsageLimits::default())
+            .include_system_prompt(first)
+            .build();
 
         let result = agent.run_with_toolsets(input).await?;
         println!("{}", result.output);

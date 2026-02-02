@@ -22,6 +22,10 @@ use crate::model::{
 use crate::providers::{Provider, ProviderError};
 use crate::usage::RequestUsage;
 
+struct OpenAIRequest {
+    body: Value,
+}
+
 fn map_reqwest_error(label: &str, error: reqwest::Error) -> ModelError {
     if error.is_timeout() {
         return ModelError::Timeout;
@@ -228,8 +232,9 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::messages::{
-        ModelMessage, ModelRequest, ModelRequestPart, ModelResponse, ModelResponsePart,
-        ProviderItemPart, TextPart, ToolCallPart, ToolReturnPart,
+        AudioUrl, BinaryContent, DocumentUrl, ImageUrl, ModelMessage, ModelRequest,
+        ModelRequestPart, ModelResponse, ModelResponsePart, ProviderItemPart, TextPart,
+        ToolCallPart, ToolReturnPart, UserContent,
     };
 
     fn fixture_bytes(name: &str) -> Vec<u8> {
@@ -499,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_model_streaming_errors_for_responses_only() {
+    fn unified_model_streaming_supports_responses_only() {
         let model = OpenAIUnifiedModel::new(
             "gpt-5-mini",
             "test-key".to_string(),
@@ -507,8 +512,294 @@ mod tests {
             None,
         );
 
-        let err = model.select_api(&[], true).expect_err("streaming error");
-        assert!(matches!(err, ModelError::Unsupported(_)));
+        let mode = model.select_api(&[], true).expect("select api for stream");
+        assert!(matches!(mode, OpenAIApiMode::Responses));
+    }
+
+    #[test]
+    fn make_messages_groups_consecutive_tool_calls() {
+        let model = OpenAIChatModel::new(
+            "gpt-4o-mini",
+            "test-key".to_string(),
+            Url::parse("https://example.com/").expect("valid url"),
+            None,
+        );
+
+        let messages = vec![
+            ModelMessage::Response(ModelResponse {
+                parts: vec![ModelResponsePart::ToolCall(ToolCallPart {
+                    id: "call-1".to_string(),
+                    name: "get_data".to_string(),
+                    arguments: json!({"a": 1}),
+                })],
+                usage: None,
+                model_name: None,
+                finish_reason: None,
+            }),
+            ModelMessage::Response(ModelResponse {
+                parts: vec![ModelResponsePart::ToolCall(ToolCallPart {
+                    id: "call-2".to_string(),
+                    name: "get_data".to_string(),
+                    arguments: json!({"b": 2}),
+                })],
+                usage: None,
+                model_name: None,
+                finish_reason: None,
+            }),
+        ];
+
+        let out = model.make_messages(&messages).expect("make messages");
+        assert_eq!(out.len(), 1);
+        let assistant = out[0].as_object().expect("assistant message");
+        let tool_calls = assistant
+            .get("tool_calls")
+            .and_then(|value| value.as_array())
+            .expect("tool_calls");
+        assert_eq!(tool_calls.len(), 2);
+    }
+
+    #[test]
+    fn responses_build_request_maps_max_tokens() {
+        let model = OpenAIResponsesModel::new(
+            "gpt-5-mini",
+            "test-key".to_string(),
+            Url::parse("https://example.com/").expect("valid url"),
+            None,
+        );
+
+        let messages = vec![ModelMessage::Request(ModelRequest::user_text_prompt("hi"))];
+        let params = ModelRequestParameters::default();
+        let mut settings = Map::new();
+        settings.insert("max_tokens".to_string(), Value::Number(42.into()));
+
+        let request = model
+            .build_request(&messages, Some(&settings), &params, false)
+            .expect("build request");
+        let body = request.body.as_object().expect("body object");
+        assert!(body.contains_key("max_output_tokens"));
+        assert!(!body.contains_key("max_tokens"));
+    }
+
+    #[test]
+    fn responses_stream_helpers_parse_tool_calls_and_usage() {
+        let item = json!({
+            "type": "function_call",
+            "name": "echo",
+            "call_id": "call-1",
+            "arguments": "{\"msg\":\"hi\"}"
+        });
+        let call = parse_responses_stream_tool_call(&item).expect("tool call");
+        assert_eq!(call.name, "echo");
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.arguments, json!({"msg": "hi"}));
+
+        let response = json!({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5
+            }
+        });
+        let usage = parse_responses_stream_usage(&response).expect("usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn helper_functions_cover_ids_and_media_types() {
+        assert!(is_text_like_media_type("text/plain"));
+        assert!(is_text_like_media_type("application/json"));
+        assert!(!is_text_like_media_type("image/png"));
+
+        assert_eq!(audio_format_from_media_type("audio/mpeg"), Some("mp3"));
+        assert_eq!(audio_format_from_media_type("audio/aac"), Some("aac"));
+        assert_eq!(audio_format_from_media_type("audio/unknown"), None);
+
+        let parsed = parse_data_url_base64("data:audio/mpeg;base64,SGVsbG8=").expect("parse");
+        assert_eq!(parsed.0, "audio/mpeg");
+        assert_eq!(parsed.1, "SGVsbG8=");
+        assert!(parse_data_url_base64("https://example.com").is_none());
+
+        let id = normalize_tool_call_id(Some("".to_string()));
+        assert!(id.starts_with("call_"));
+        let id = normalize_tool_call_id_str("");
+        assert!(id.starts_with("call_"));
+
+        let id = normalize_stream_tool_call_id(None, Some(2));
+        assert_eq!(id, "call_2");
+
+        let id = normalize_stream_tool_call_id(Some("explicit".to_string()), Some(1));
+        assert_eq!(id, "explicit");
+    }
+
+    #[test]
+    fn helper_functions_cover_text_and_urls() {
+        let long_body = "a".repeat(2100);
+        let truncated = truncate_error_body(&format!("{long_body}\n"));
+        assert!(truncated.ends_with("...[truncated]"));
+
+        let base = Url::parse("https://example.com/v1/").expect("url");
+        let joined = join_path(&base, "chat/completions").expect("join");
+        assert_eq!(joined.as_str(), "https://example.com/v1/chat/completions");
+
+        assert_eq!(tool_return_content(&json!("ok")), "ok");
+        assert_eq!(tool_call_arguments(&json!({"a": 1})), "{\"a\":1}");
+
+        assert!(is_responses_only_model("gpt-5-mini"));
+        assert!(!is_responses_only_model("gpt-4o-mini"));
+        assert!(prefers_responses("gpt-4o-mini"));
+        assert!(!prefers_responses("gpt-3.5-turbo"));
+    }
+
+    #[test]
+    fn contains_audio_detects_audio_inputs() {
+        let messages = vec![ModelMessage::Request(ModelRequest {
+            parts: vec![ModelRequestPart::UserPrompt(
+                crate::messages::UserPromptPart {
+                    content: vec![UserContent::Audio(AudioUrl {
+                        url: "data:audio/mpeg;base64,SGVsbG8=".to_string(),
+                        media_type: None,
+                    })],
+                },
+            )],
+            instructions: None,
+        })];
+        assert!(contains_audio(&messages));
+    }
+
+    #[test]
+    fn convert_user_content_handles_text_and_urls() {
+        let model = OpenAIChatModel::new(
+            "gpt-4o-mini",
+            "test-key".to_string(),
+            Url::parse("https://example.com/").expect("valid url"),
+            None,
+        );
+
+        let content = vec![
+            UserContent::Text("hello".to_string()),
+            UserContent::Image(ImageUrl {
+                url: "https://example.com/image.png".to_string(),
+                media_type: None,
+            }),
+            UserContent::Audio(AudioUrl {
+                url: "data:audio/mpeg;base64,SGVsbG8=".to_string(),
+                media_type: None,
+            }),
+            UserContent::Document(DocumentUrl {
+                url: "data:text/plain;base64,SGVsbG8=".to_string(),
+                media_type: None,
+            }),
+            UserContent::Document(DocumentUrl {
+                url: "https://example.com/doc.pdf".to_string(),
+                media_type: None,
+            }),
+        ];
+
+        let parts = model
+            .convert_user_content(&content)
+            .expect("convert user content");
+        let parts = parts.as_array().expect("parts array");
+        assert_eq!(parts.len(), 5);
+        assert_eq!(
+            parts[0].get("type"),
+            Some(&Value::String("text".to_string()))
+        );
+        assert_eq!(
+            parts[1].get("type"),
+            Some(&Value::String("image_url".to_string()))
+        );
+        assert_eq!(
+            parts[2].get("type"),
+            Some(&Value::String("input_audio".to_string()))
+        );
+        assert_eq!(
+            parts[3].get("text"),
+            Some(&Value::String("Hello".to_string()))
+        );
+        assert_eq!(
+            parts[4].get("text"),
+            Some(&Value::String(
+                "[document: https://example.com/doc.pdf]".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn convert_user_content_rejects_binary_images_when_disabled() {
+        let model = OpenAIChatModel::new_with_capabilities(
+            "gpt-4o-mini",
+            "test-key".to_string(),
+            Url::parse("https://example.com/").expect("valid url"),
+            None,
+            OpenAIChatCapabilities {
+                supports_response_format: true,
+                supports_parallel_tool_calls: true,
+                reject_binary_images: true,
+            },
+        );
+
+        let content = vec![UserContent::Binary(BinaryContent {
+            data: vec![1, 2, 3],
+            media_type: "image/png".to_string(),
+        })];
+
+        let err = model
+            .convert_user_content(&content)
+            .expect_err("should error");
+        match err {
+            ModelError::Unsupported(message) => {
+                assert!(message.contains("binary image inputs"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_helpers_cover_media_filename_and_content() {
+        assert_eq!(
+            OpenAIResponsesModel::filename_for_media_type("application/pdf"),
+            "file.pdf"
+        );
+        assert_eq!(
+            OpenAIResponsesModel::filename_for_media_type("text/plain"),
+            "file.txt"
+        );
+        assert_eq!(
+            OpenAIResponsesModel::filename_for_media_type("image/png"),
+            "file.bin"
+        );
+
+        let model = OpenAIResponsesModel::new(
+            "gpt-5-mini",
+            "test-key".to_string(),
+            Url::parse("https://example.com/").expect("valid url"),
+            None,
+        );
+
+        let content = vec![
+            UserContent::Binary(BinaryContent {
+                data: b"hello".to_vec(),
+                media_type: "text/plain".to_string(),
+            }),
+            UserContent::Document(DocumentUrl {
+                url: "data:application/pdf;base64,SGVsbG8=".to_string(),
+                media_type: None,
+            }),
+        ];
+
+        let parts = model
+            .convert_user_content(&content)
+            .expect("convert content");
+        let parts = parts.as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].get("type"),
+            Some(&Value::String("input_text".to_string()))
+        );
+        assert_eq!(
+            parts[1].get("type"),
+            Some(&Value::String("input_file".to_string()))
+        );
     }
 }
 
@@ -628,30 +919,49 @@ impl OpenAIChatModel {
                         continue;
                     }
 
+                    let calls = tool_calls
+                        .into_iter()
+                        .map(|call| {
+                            let args = tool_call_arguments(&call.arguments);
+                            json!({
+                                "id": normalize_tool_call_id_str(&call.id),
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": args,
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+
+                    if text.is_none()
+                        && !calls.is_empty()
+                        && let Some(Value::Object(last)) = out.last_mut()
+                    {
+                        let is_assistant =
+                            last.get("role").and_then(|value| value.as_str()) == Some("assistant");
+                        let is_tool_calls = last.get("content").is_some_and(Value::is_null)
+                            && last.get("tool_calls").is_some();
+                        if is_assistant
+                            && is_tool_calls
+                            && let Some(existing) =
+                                last.get_mut("tool_calls").and_then(Value::as_array_mut)
+                        {
+                            existing.extend(calls);
+                            continue;
+                        }
+                    }
+
                     let mut msg = Map::new();
                     msg.insert("role".to_string(), Value::String("assistant".to_string()));
 
                     if let Some(text) = text {
                         msg.insert("content".to_string(), Value::String(text));
-                    } else if !tool_calls.is_empty() {
+                    } else if !calls.is_empty() {
                         msg.insert("content".to_string(), Value::Null);
                     }
 
-                    if !tool_calls.is_empty() {
-                        let calls = tool_calls
-                            .into_iter()
-                            .map(|call| {
-                                let args = tool_call_arguments(&call.arguments);
-                                json!({
-                                    "id": normalize_tool_call_id_str(&call.id),
-                                    "type": "function",
-                                    "function": {
-                                        "name": call.name,
-                                        "arguments": args,
-                                    }
-                                })
-                            })
-                            .collect::<Vec<_>>();
+                    if !calls.is_empty() {
                         msg.insert("tool_calls".to_string(), Value::Array(calls));
                     }
 
@@ -840,6 +1150,24 @@ impl OpenAIChatModel {
         Ok(Value::Object(body))
     }
 
+    fn build_request(
+        &self,
+        messages: &[ModelMessage],
+        settings: Option<&ModelSettings>,
+        params: &ModelRequestParameters,
+        stream: bool,
+    ) -> Result<OpenAIRequest, ModelError> {
+        let mut body = self.build_body(messages, params, stream)?;
+        if let Some(settings) = settings
+            && let Value::Object(map) = &mut body
+        {
+            for (key, value) in settings {
+                map.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(OpenAIRequest { body })
+    }
+
     fn parse_tool_call(tool_call: &OpenAIToolCall) -> ToolCallPart {
         let args = tool_call
             .function
@@ -885,20 +1213,13 @@ impl Model for OpenAIChatModel {
             output_schema = params.output_schema.is_some(),
             "OpenAI chat request"
         );
-        let mut body = self.build_body(messages, params, false)?;
-        if let Some(settings) = settings
-            && let Value::Object(map) = &mut body
-        {
-            for (key, value) in settings {
-                map.insert(key.clone(), value.clone());
-            }
-        }
+        let request = self.build_request(messages, settings, params, false)?;
 
         let response = self
             .client
             .post(self.endpoint()?)
             .bearer_auth(&self.api_key)
-            .json(&body)
+            .json(&request.body)
             .send()
             .await
             .map_err(|e| map_reqwest_error("OpenAI", e))?;
@@ -980,20 +1301,13 @@ impl Model for OpenAIChatModel {
             output_schema = params.output_schema.is_some(),
             "OpenAI stream request"
         );
-        let mut body = self.build_body(messages, params, true)?;
-        if let Some(settings) = settings
-            && let Value::Object(map) = &mut body
-        {
-            for (key, value) in settings {
-                map.insert(key.clone(), value.clone());
-            }
-        }
+        let request = self.build_request(messages, settings, params, true)?;
 
         let response = self
             .client
             .post(self.endpoint()?)
             .bearer_auth(&self.api_key)
-            .json(&body)
+            .json(&request.body)
             .send()
             .await
             .map_err(|e| map_reqwest_error("OpenAI stream", e))?;
@@ -1192,6 +1506,65 @@ struct ToolAccumulator {
     arguments: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct OpenAIResponsesStreamEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    response: Option<Value>,
+    item: Option<Value>,
+    delta: Option<String>,
+}
+
+fn parse_responses_stream_usage(value: &Value) -> Option<RequestUsage> {
+    let usage = value.get("usage")?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Some(RequestUsage {
+        input_tokens,
+        output_tokens,
+        ..Default::default()
+    })
+}
+
+fn parse_responses_stream_tool_call(item: &Value) -> Option<ToolCallPart> {
+    let item_type = item.get("type").and_then(|v| v.as_str())?;
+    if item_type != "function_call" {
+        return None;
+    }
+    let name = item
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("tool")
+        .to_string();
+    let call_id = item
+        .get("call_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            item.get("id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+    let arguments = item.get("arguments").cloned().unwrap_or(Value::Null);
+    let args = match arguments {
+        Value::String(value) => {
+            serde_json::from_str::<Value>(&value).unwrap_or(Value::String(value))
+        }
+        other => other,
+    };
+    Some(ToolCallPart {
+        id: normalize_tool_call_id(call_id),
+        name,
+        arguments: args,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenAIUnifiedModel {
     model: String,
@@ -1240,9 +1613,7 @@ impl OpenAIUnifiedModel {
         }
         if stream {
             if self.responses_only {
-                return Err(ModelError::Unsupported(
-                    "streaming not supported for OpenAI Responses API".to_string(),
-                ));
+                return Ok(OpenAIApiMode::Responses);
             }
             return Ok(OpenAIApiMode::Chat);
         }
@@ -1286,9 +1657,11 @@ impl Model for OpenAIUnifiedModel {
     ) -> Result<ModelStream, ModelError> {
         match self.select_api(messages, true)? {
             OpenAIApiMode::Chat => self.chat.request_stream(messages, settings, params).await,
-            OpenAIApiMode::Responses => Err(ModelError::Unsupported(
-                "streaming not supported for OpenAI Responses API".to_string(),
-            )),
+            OpenAIApiMode::Responses => {
+                self.responses
+                    .request_stream(messages, settings, params)
+                    .await
+            }
         }
     }
 }
@@ -1486,6 +1859,7 @@ impl OpenAIResponsesModel {
         &self,
         messages: &[ModelMessage],
         params: &ModelRequestParameters,
+        stream: bool,
     ) -> Result<Value, ModelError> {
         let mut body = Map::new();
         body.insert("model".to_string(), Value::String(self.model.clone()));
@@ -1533,17 +1907,44 @@ impl OpenAIResponsesModel {
             );
         }
 
+        if stream {
+            body.insert("stream".to_string(), Value::Bool(true));
+        }
+
         if let Some(settings) = &self.default_settings {
             for (key, value) in settings {
-                if key == "max_tokens" && !body.contains_key("max_output_tokens") {
+                if key == "max_tokens" {
                     body.insert("max_output_tokens".to_string(), value.clone());
-                } else {
-                    body.insert(key.clone(), value.clone());
+                    continue;
                 }
+                body.insert(key.clone(), value.clone());
             }
         }
 
         Ok(Value::Object(body))
+    }
+
+    fn build_request(
+        &self,
+        messages: &[ModelMessage],
+        settings: Option<&ModelSettings>,
+        params: &ModelRequestParameters,
+        stream: bool,
+    ) -> Result<OpenAIRequest, ModelError> {
+        let mut body = self.build_body(messages, params, stream)?;
+        if let Some(settings) = settings
+            && let Value::Object(map) = &mut body
+        {
+            for (key, value) in settings {
+                if key == "max_tokens" {
+                    map.insert("max_output_tokens".to_string(), value.clone());
+                    continue;
+                }
+                map.insert(key.clone(), value.clone());
+            }
+        }
+
+        Ok(OpenAIRequest { body })
     }
 }
 
@@ -1565,24 +1966,13 @@ impl Model for OpenAIResponsesModel {
             output_schema = params.output_schema.is_some(),
             "OpenAI responses request"
         );
-        let mut body = self.build_body(messages, params)?;
-        if let Some(settings) = settings
-            && let Value::Object(map) = &mut body
-        {
-            for (key, value) in settings {
-                if key == "max_tokens" && !map.contains_key("max_output_tokens") {
-                    map.insert("max_output_tokens".to_string(), value.clone());
-                } else {
-                    map.insert(key.clone(), value.clone());
-                }
-            }
-        }
+        let request = self.build_request(messages, settings, params, false)?;
 
         let response = self
             .client
             .post(self.endpoint()?)
             .bearer_auth(&self.api_key)
-            .json(&body)
+            .json(&request.body)
             .send()
             .await
             .map_err(|e| map_reqwest_error("OpenAI Responses", e))?;
@@ -1675,6 +2065,113 @@ impl Model for OpenAIResponsesModel {
             model_name: body.model.or_else(|| Some(self.model.clone())),
             finish_reason: body.finish_reason,
         })
+    }
+
+    async fn request_stream(
+        &self,
+        messages: &[ModelMessage],
+        settings: Option<&ModelSettings>,
+        params: &ModelRequestParameters,
+    ) -> Result<ModelStream, ModelError> {
+        tracing::debug!(
+            model = %self.model,
+            tool_count = params.function_tools.len(),
+            output_schema = params.output_schema.is_some(),
+            "OpenAI responses stream request"
+        );
+        let request = self.build_request(messages, settings, params, true)?;
+
+        let response = self
+            .client
+            .post(self.endpoint()?)
+            .bearer_auth(&self.api_key)
+            .json(&request.body)
+            .send()
+            .await
+            .map_err(|e| map_reqwest_error("OpenAI Responses stream", e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!(
+                status = status.as_u16(),
+                model = %self.model,
+                body = %truncate_error_body(&body),
+                "OpenAI responses stream request failed"
+            );
+            return Err(ModelError::HttpStatus {
+                status: status.as_u16(),
+            });
+        }
+
+        let mut event_stream = response.bytes_stream().eventsource();
+        let model_name = self.model.clone();
+
+        let s = try_stream! {
+            while let Some(event) = event_stream.next().await {
+                let event = event.map_err(|e| {
+                    tracing::error!(error = %e, model = %model_name, "OpenAI responses stream error");
+                    ModelError::Provider(format!("OpenAI responses stream error: {e}"))
+                })?;
+                let data = event.data;
+                if data.trim() == "[DONE]" {
+                    break;
+                }
+                let event: OpenAIResponsesStreamEvent = serde_json::from_str(&data).map_err(|e| {
+                    tracing::error!(error = %e, model = %model_name, "OpenAI responses stream parse error");
+                    ModelError::Provider(format!("OpenAI responses stream parse error: {e}"))
+                })?;
+
+                match event.kind.as_str() {
+                    "response.output_text.delta" => {
+                        if let Some(delta) = event.delta {
+                            yield StreamChunk {
+                                text_delta: Some(delta),
+                                tool_call: None,
+                                finish_reason: None,
+                                usage: None,
+                            };
+                        }
+                    }
+                    "response.output_item.done" => {
+                        if let Some(item) = event.item
+                            && let Some(call) = parse_responses_stream_tool_call(&item)
+                        {
+                            yield StreamChunk {
+                                text_delta: None,
+                                tool_call: Some(call),
+                                finish_reason: None,
+                                usage: None,
+                            };
+                        }
+                    }
+                    "response.completed" | "response.done" => {
+                        let usage = event
+                            .response
+                            .as_ref()
+                            .and_then(parse_responses_stream_usage);
+                        yield StreamChunk {
+                            text_delta: None,
+                            tool_call: None,
+                            finish_reason: Some("stop".to_string()),
+                            usage,
+                        };
+                    }
+                    "response.failed" => {
+                        let detail = event
+                            .response
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "response.failed".to_string());
+                        Err(ModelError::Provider(format!(
+                            "OpenAI responses stream failed: {detail}"
+                        )))?;
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        Ok(Box::pin(s))
     }
 }
 

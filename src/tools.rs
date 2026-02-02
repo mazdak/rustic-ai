@@ -12,7 +12,7 @@ use crate::messages::{ModelMessage, UserContent};
 use crate::model::Model;
 use crate::usage::RunUsage;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ToolKind {
     Function,
     Output,
@@ -75,8 +75,8 @@ pub struct RunContext<Deps> {
     pub deps: Arc<Deps>,
     pub model: Arc<dyn Model>,
     pub usage: RunUsage,
-    pub prompt: Option<Vec<UserContent>>,
-    pub messages: Vec<ModelMessage>,
+    pub prompt: Option<Arc<Vec<UserContent>>>,
+    pub messages: Arc<Vec<ModelMessage>>,
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
 }
@@ -89,7 +89,7 @@ impl<Deps> RunContext<Deps> {
             model: Arc::clone(&self.model),
             usage: self.usage.clone(),
             prompt: self.prompt.clone(),
-            messages: self.messages.clone(),
+            messages: Arc::clone(&self.messages),
             tool_call_id: Some(tool_call_id),
             tool_name: Some(tool_name),
         }

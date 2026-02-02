@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use async_stream::try_stream;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use futures::future::join_all;
 use futures::stream::Stream;
 use jsonschema::{Draft, JSONSchema};
+use schemars::JsonSchema;
 use serde_json::Value;
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -48,6 +48,8 @@ pub struct Agent<Deps> {
     prepare_tools: Option<PrepareToolsFn<Deps>>,
     instrumenter: Arc<dyn Instrumenter>,
     output_schema: Option<Value>,
+    output_schema_compiled: Option<Arc<JSONSchema>>,
+    output_schema_error: Option<String>,
     output_retries: u32,
     allow_text_output: bool,
 }
@@ -77,6 +79,8 @@ where
             prepare_tools: None,
             instrumenter: Arc::new(NoopInstrumenter),
             output_schema: None,
+            output_schema_compiled: None,
+            output_schema_error: None,
             output_retries: 0,
             allow_text_output: false,
         }
@@ -98,8 +102,36 @@ where
     }
 
     pub fn output_schema(mut self, schema: Value) -> Self {
+        let compiled = JSONSchema::options()
+            .with_draft(Draft::Draft7)
+            .compile(&schema)
+            .map(Arc::new)
+            .map_err(|err| format!("Invalid JSON schema: {err}"));
+        match compiled {
+            Ok(compiled) => {
+                self.output_schema_compiled = Some(compiled);
+                self.output_schema_error = None;
+            }
+            Err(err) => {
+                self.output_schema_compiled = None;
+                self.output_schema_error = Some(err);
+            }
+        }
         self.output_schema = Some(schema);
         self
+    }
+
+    pub fn output_schema_for<T: JsonSchema>(mut self) -> Self {
+        let schema_value = match serde_json::to_value(schemars::schema_for!(T)) {
+            Ok(value) => value,
+            Err(err) => {
+                self.output_schema = None;
+                self.output_schema_compiled = None;
+                self.output_schema_error = Some(format!("Invalid JSON schema: {err}"));
+                return self;
+            }
+        };
+        self.output_schema(schema_value)
     }
 
     pub fn output_retries(mut self, retries: u32) -> Self {
@@ -173,6 +205,7 @@ where
 
         let mut messages = Vec::new();
         let output_instructions = self.output_schema.as_ref().map(build_output_instructions);
+        let prompt_arc = Arc::new(user_prompt.clone());
 
         if include_system_prompt && let Some(prompt) = &self.system_prompt {
             messages.push(ModelMessage::Request(ModelRequest {
@@ -205,13 +238,14 @@ where
         let mut run_started = false;
 
         let result = 'run: loop {
+            let messages_arc = Arc::new(messages.clone());
             let run_ctx = RunContext {
                 run_id: run_id.clone(),
                 deps: Arc::clone(&deps),
                 model: Arc::clone(&model),
                 usage: usage.clone(),
-                prompt: Some(user_prompt.clone()),
-                messages: messages.clone(),
+                prompt: Some(Arc::clone(&prompt_arc)),
+                messages: Arc::clone(&messages_arc),
                 tool_call_id: None,
                 tool_name: None,
             };
@@ -317,7 +351,13 @@ where
                 let output = response.text().unwrap_or_default();
                 let parsed_output = match self.output_schema.as_ref() {
                     Some(schema) => {
-                        match validate_output(schema, &output, self.allow_text_output) {
+                        match validate_output(
+                            schema,
+                            self.output_schema_compiled.as_deref(),
+                            self.output_schema_error.as_deref(),
+                            &output,
+                            self.allow_text_output,
+                        ) {
                             Ok(parsed) => parsed,
                             Err(err) => {
                                 if output_attempts < self.output_retries {
@@ -359,6 +399,7 @@ where
                 });
             }
 
+            let messages_for_tools = Arc::new(messages.clone());
             let mut deferred_calls = Vec::new();
             let mut executable_calls: Vec<(usize, ToolCallPart, ToolEntry<Deps>)> = Vec::new();
             for (index, call) in tool_calls.into_iter().enumerate() {
@@ -419,8 +460,8 @@ where
                         deps: Arc::clone(&deps),
                         model: Arc::clone(&model),
                         usage: usage.clone(),
-                        prompt: Some(user_prompt.clone()),
-                        messages: messages.clone(),
+                        prompt: Some(Arc::clone(&prompt_arc)),
+                        messages: Arc::clone(&messages_for_tools),
                         tool_call_id: None,
                         tool_name: None,
                     };
@@ -441,15 +482,15 @@ where
                     ));
                 }
             } else if !executable_calls.is_empty() {
-                let mut futures = Vec::new();
+                let mut futures = futures::stream::FuturesUnordered::new();
                 for (index, call, entry) in executable_calls {
                     let tool_ctx = RunContext {
                         run_id: run_id.clone(),
                         deps: Arc::clone(&deps),
                         model: Arc::clone(&model),
                         usage: usage.clone(),
-                        prompt: Some(user_prompt.clone()),
-                        messages: messages.clone(),
+                        prompt: Some(Arc::clone(&prompt_arc)),
+                        messages: Arc::clone(&messages_for_tools),
                         tool_call_id: None,
                         tool_name: None,
                     };
@@ -462,7 +503,7 @@ where
                         (index, call_clone, result)
                     });
                 }
-                for (index, call, result) in join_all(futures).await {
+                while let Some((index, call, result)) = futures.next().await {
                     let tool_result = match result {
                         Ok(result) => result,
                         Err(err) => break 'run Err(err),
@@ -627,6 +668,7 @@ where
         let run_id = resolve_run_id(run_id);
         let run_started_at = Instant::now();
         let model_name = self.model.name().to_string();
+        let prompt_arc = Arc::new(user_prompt.clone());
 
         if include_system_prompt && let Some(prompt) = &self.system_prompt {
             messages.push(ModelMessage::Request(ModelRequest {
@@ -652,8 +694,8 @@ where
             deps: Arc::clone(&deps),
             model: Arc::clone(&self.model),
             usage: RunUsage::default(),
-            prompt: Some(user_prompt.clone()),
-            messages: messages.clone(),
+            prompt: Some(Arc::clone(&prompt_arc)),
+            messages: Arc::new(messages.clone()),
             tool_call_id: None,
             tool_name: None,
         };
@@ -779,6 +821,8 @@ where
 
         let instrumenter = Arc::clone(&self.instrumenter);
         let output_schema = self.output_schema.clone();
+        let output_schema_compiled = self.output_schema_compiled.clone();
+        let output_schema_error = self.output_schema_error.clone();
         let allow_text_output = self.allow_text_output;
         let run_id_for_stream = run_id.clone();
         let model_name_for_stream = model_name.clone();
@@ -931,6 +975,7 @@ where
                 streaming: true,
             });
 
+            let has_tool_calls = !tool_calls.is_empty();
             let mut deferred_calls = Vec::new();
             for call in tool_calls {
                 let kind = tool_map_for_stream
@@ -945,30 +990,40 @@ where
                 });
             }
 
-            let parsed_output = match output_schema.as_ref() {
-                Some(schema) => match validate_output(schema, &output_text, allow_text_output) {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        instrumenter.on_output_validation_error(&OutputValidationErrorInfo {
-                            run_id: run_id_for_stream.clone(),
-                            model_name: model_name_for_stream.clone(),
-                            error: err.clone(),
-                            output_len: output_text.len(),
-                        });
-                        let agent_err = AgentError::OutputValidation(err);
-                        instrumenter.on_run_error(&RunErrorInfo {
-                            run_id: run_id_for_stream.clone(),
-                            model_name: model_name_for_stream.clone(),
-                            error: agent_err.to_string(),
-                            error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
-                                .map(str::to_string),
-                            streaming: true,
-                            duration: run_started_at_for_stream.elapsed(),
-                        });
-                        Err(agent_err)?
-                    }
-                },
-                None => None,
+            let parsed_output = if !has_tool_calls {
+                match output_schema.as_ref() {
+                    Some(schema) => match validate_output(
+                        schema,
+                        output_schema_compiled.as_deref(),
+                        output_schema_error.as_deref(),
+                        &output_text,
+                        allow_text_output,
+                    ) {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            instrumenter.on_output_validation_error(&OutputValidationErrorInfo {
+                                run_id: run_id_for_stream.clone(),
+                                model_name: model_name_for_stream.clone(),
+                                error: err.clone(),
+                                output_len: output_text.len(),
+                            });
+                            let agent_err = AgentError::OutputValidation(err);
+                            instrumenter.on_run_error(&RunErrorInfo {
+                                run_id: run_id_for_stream.clone(),
+                                model_name: model_name_for_stream.clone(),
+                                error: agent_err.to_string(),
+                                error_kind: classify_error_kind(&agent_err as &dyn std::error::Error)
+                                    .map(str::to_string),
+                                streaming: true,
+                                duration: run_started_at_for_stream.elapsed(),
+                            });
+                            Err(agent_err)?
+                        }
+                    },
+                    None => None,
+                }
+            } else {
+                None
             };
 
             let state = if deferred_calls.is_empty() {
@@ -1056,9 +1111,42 @@ where
     ) -> Result<(Vec<ToolDefinition>, HashMap<String, ToolEntry<Deps>>), ToolError> {
         if let Some(prepare) = &self.prepare_tools {
             let filtered = (prepare)(ctx, tool_defs).await?;
-            let allowed: HashSet<String> = filtered.iter().map(|def| def.name.clone()).collect();
-            debug!(count = allowed.len(), "prepare_tools filtered tool list");
-            tool_map.retain(|name, _| allowed.contains(name));
+            let mut prepared_defs = HashMap::new();
+            for def in &filtered {
+                if prepared_defs
+                    .insert(def.name.clone(), def.clone())
+                    .is_some()
+                {
+                    return Err(ToolError::Toolset(format!(
+                        "prepare_tools returned duplicate tool name '{}'",
+                        def.name
+                    )));
+                }
+            }
+
+            let extra: Vec<String> = prepared_defs
+                .keys()
+                .filter(|name| !tool_map.contains_key(*name))
+                .cloned()
+                .collect();
+            if !extra.is_empty() {
+                return Err(ToolError::Toolset(format!(
+                    "prepare_tools cannot add or rename tools: {}",
+                    extra.join(", ")
+                )));
+            }
+
+            debug!(
+                count = prepared_defs.len(),
+                "prepare_tools filtered tool list"
+            );
+            tool_map.retain(|name, _| prepared_defs.contains_key(name));
+            for (name, entry) in tool_map.iter_mut() {
+                if let Some(def) = prepared_defs.get(name) {
+                    entry.definition = def.clone();
+                }
+            }
+
             Ok((filtered, tool_map))
         } else {
             Ok((tool_defs, tool_map))
@@ -1141,6 +1229,8 @@ fn build_output_instructions(schema: &Value) -> String {
 
 fn validate_output(
     schema: &Value,
+    compiled: Option<&JSONSchema>,
+    compiled_error: Option<&str>,
     output: &str,
     allow_text: bool,
 ) -> Result<Option<Value>, String> {
@@ -1154,10 +1244,13 @@ fn validate_output(
         }
     };
 
-    let compiled = JSONSchema::options()
-        .with_draft(Draft::Draft7)
-        .compile(schema)
-        .map_err(|err| format!("Invalid JSON schema: {err}"))?;
+    let compiled = if let Some(compiled) = compiled {
+        compiled
+    } else if let Some(err) = compiled_error {
+        return Err(err.to_string());
+    } else {
+        return Err(format!("Invalid JSON schema: {}", schema));
+    };
 
     if let Err(errors) = compiled.validate(&parsed) {
         let mut messages = Vec::new();
@@ -1283,6 +1376,88 @@ impl<Deps> RunInput<Deps> {
     pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
         self.run_id = Some(run_id.into());
         self
+    }
+
+    pub fn builder(deps: Deps) -> RunInputBuilder<Deps, MissingPrompt> {
+        RunInputBuilder::new(deps)
+    }
+}
+
+pub struct MissingPrompt;
+pub struct ReadyPrompt;
+
+pub struct RunInputBuilder<Deps, State = MissingPrompt> {
+    user_prompt: Option<Vec<UserContent>>,
+    message_history: Vec<ModelMessage>,
+    deps: Deps,
+    usage_limits: UsageLimits,
+    include_system_prompt: bool,
+    run_id: Option<String>,
+    state: std::marker::PhantomData<State>,
+}
+
+impl<Deps> RunInputBuilder<Deps, MissingPrompt> {
+    fn new(deps: Deps) -> Self {
+        Self {
+            user_prompt: None,
+            message_history: Vec::new(),
+            deps,
+            usage_limits: UsageLimits::default(),
+            include_system_prompt: true,
+            run_id: None,
+            state: std::marker::PhantomData,
+        }
+    }
+
+    pub fn prompt(self, user_prompt: Vec<UserContent>) -> RunInputBuilder<Deps, ReadyPrompt> {
+        RunInputBuilder {
+            user_prompt: Some(user_prompt),
+            message_history: self.message_history,
+            deps: self.deps,
+            usage_limits: self.usage_limits,
+            include_system_prompt: self.include_system_prompt,
+            run_id: self.run_id,
+            state: std::marker::PhantomData,
+        }
+    }
+
+    pub fn user_text(self, text: impl Into<String>) -> RunInputBuilder<Deps, ReadyPrompt> {
+        self.prompt(vec![UserContent::Text(text.into())])
+    }
+}
+
+impl<Deps, State> RunInputBuilder<Deps, State> {
+    pub fn message_history(mut self, history: Vec<ModelMessage>) -> Self {
+        self.message_history = history;
+        self
+    }
+
+    pub fn usage_limits(mut self, usage_limits: UsageLimits) -> Self {
+        self.usage_limits = usage_limits;
+        self
+    }
+
+    pub fn include_system_prompt(mut self, include: bool) -> Self {
+        self.include_system_prompt = include;
+        self
+    }
+
+    pub fn run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
+    }
+}
+
+impl<Deps> RunInputBuilder<Deps, ReadyPrompt> {
+    pub fn build(self) -> RunInput<Deps> {
+        RunInput {
+            user_prompt: self.user_prompt.unwrap_or_default(),
+            message_history: self.message_history,
+            deps: self.deps,
+            usage_limits: self.usage_limits,
+            include_system_prompt: self.include_system_prompt,
+            run_id: self.run_id,
+        }
     }
 }
 

@@ -26,6 +26,44 @@
 //! # }
 //! ```
 //!
+//! Type-state builder:
+//!
+//! ```rust,no_run
+//! use rustic_ai::{RunInput, UsageLimits};
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let input = RunInput::builder(())
+//!     .user_text("Hello!")
+//!     .usage_limits(UsageLimits::default())
+//!     .build();
+//! # let _ = input;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Typed structured output:
+//!
+//! ```rust,no_run
+//! use rustic_ai::{Agent, RunInput, UsageLimits, UserContent, infer_model, infer_provider};
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! #[derive(Deserialize, JsonSchema)]
+//! struct Answer {
+//!     answer: String,
+//! }
+//! let model = infer_model("openai:gpt-4o-mini", infer_provider)?;
+//! let agent = Agent::new(model).output_schema_for::<Answer>();
+//! let input = RunInput::new(
+//!     vec![UserContent::Text("Respond with {\"answer\": \"ok\"}".to_string())],
+//!     vec![],
+//!     (),
+//!     UsageLimits::default(),
+//! );
+//! let _ = agent.run(input).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ## Features
 //!
 //! - **Agent orchestration** with tool calling, usage limits, and message history
@@ -59,7 +97,10 @@ pub mod telemetry;
 pub mod tools;
 pub mod usage;
 
-pub use agent::{Agent, AgentRunResult, AgentRunState, DeferredToolCall, RunInput};
+pub use agent::{
+    Agent, AgentEventStream, AgentRunResult, AgentRunState, AgentStreamEvent, DeferredToolCall,
+    RunInput, RunInputBuilder,
+};
 pub use error::AgentError;
 pub use failover::{
     FailoverResult, classify_error_kind, run_with_config, run_with_config_and_classifier,

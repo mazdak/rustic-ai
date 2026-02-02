@@ -53,3 +53,22 @@ impl Provider for GrokProvider {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grok_provider_rejects_invalid_url() {
+        let err = GrokProvider::new("key", "not a url").expect_err("invalid url");
+        assert!(matches!(err, ProviderError::InvalidModel(_)));
+    }
+
+    #[test]
+    fn grok_provider_builds_model() {
+        let provider = GrokProvider::new("key", "https://api.x.ai/v1").expect("valid provider");
+        assert_eq!(provider.name(), "grok");
+        let model = provider.model("grok-test", None);
+        assert_eq!(model.name(), "grok-test");
+    }
+}

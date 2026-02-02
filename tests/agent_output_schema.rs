@@ -5,6 +5,8 @@ use rustic_ai::{
     Agent, AgentError, Model, ModelMessage, ModelRequestParameters, ModelResponse,
     ModelResponsePart, RunInput, TextPart, UsageLimits, UserContent,
 };
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::json;
 
 struct StaticModel {
@@ -42,6 +44,11 @@ fn text_response(text: &str) -> ModelResponse {
         model_name: Some("static-model".to_string()),
         finish_reason: Some("stop".to_string()),
     }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AnswerOutput {
+    answer: String,
 }
 
 #[tokio::test]
@@ -92,4 +99,29 @@ async fn output_schema_allows_text_when_configured() {
     let result = agent.run(input).await.expect("run succeeds");
     assert_eq!(result.output, "not json");
     assert!(result.parsed_output.is_none());
+}
+
+#[tokio::test]
+async fn output_schema_for_accepts_typed_schema() {
+    let sample = AnswerOutput {
+        answer: "ok".to_string(),
+    };
+    assert_eq!(sample.answer, "ok");
+
+    let model = Arc::new(StaticModel::new(text_response(r#"{"answer":"ok"}"#)));
+    let agent = Agent::new(model).output_schema_for::<AnswerOutput>();
+
+    let input = RunInput::new(
+        vec![UserContent::Text("hello".to_string())],
+        vec![],
+        (),
+        UsageLimits::default(),
+    );
+
+    let result = agent.run(input).await.expect("run succeeds");
+    let parsed = result.parsed_output.expect("parsed output present");
+    assert_eq!(
+        parsed.get("answer").and_then(|value| value.as_str()),
+        Some("ok")
+    );
 }

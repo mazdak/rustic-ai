@@ -263,6 +263,31 @@ mod tests {
             Some(&Value::String("{\"ok\":true}".to_string()))
         );
     }
+
+    #[test]
+    fn helper_functions_cover_ids_and_media() {
+        let id = normalize_tool_call_id(Some("".to_string()));
+        assert!(id.starts_with("call_"));
+        let id = normalize_tool_call_id_str("");
+        assert!(id.starts_with("call_"));
+
+        assert!(is_text_like_media_type("text/plain"));
+        assert!(is_text_like_media_type("application/json"));
+        assert!(!is_text_like_media_type("image/png"));
+
+        assert_eq!(tool_return_content(&json!("ok")), "ok");
+        assert_eq!(tool_return_content(&json!({"a": 1})), "{\"a\":1}");
+
+        assert!(is_pdf_url("https://example.com/doc.pdf"));
+        assert!(is_pdf_url("https://example.com/doc.pdf?x=1"));
+        assert!(!is_pdf_url("https://example.com/doc.txt"));
+    }
+
+    #[test]
+    fn truncate_error_body_limits_length() {
+        let truncated = truncate_error_body(&"a".repeat(600));
+        assert!(truncated.contains("bytes"));
+    }
 }
 
 impl Provider for AnthropicProvider {

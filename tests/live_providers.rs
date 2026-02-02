@@ -205,54 +205,55 @@ async fn run_tool_roundtrip(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn live_openai_tool_roundtrip() -> Result<(), Box<dyn Error + Send + Sync>> {
-    run_tool_roundtrip(
-        "openai",
-        &["OPENAI_API_KEY"],
-        "OPENAI_MODEL",
-        Some("gpt-5-mini"),
-        true,
-    )
-    .await
+macro_rules! live_tool_roundtrip_test {
+    (
+        $name:ident,
+        provider: $provider:expr,
+        api_keys: $api_keys:expr,
+        model_env: $model_env:expr,
+        fallback: $fallback:expr,
+        strict_json: $strict_json:expr
+    ) => {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore]
+        async fn $name() -> Result<(), Box<dyn Error + Send + Sync>> {
+            run_tool_roundtrip($provider, $api_keys, $model_env, $fallback, $strict_json).await
+        }
+    };
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn live_anthropic_tool_roundtrip() -> Result<(), Box<dyn Error + Send + Sync>> {
-    run_tool_roundtrip(
-        "anthropic",
-        &["ANTHROPIC_API_KEY"],
-        "ANTHROPIC_MODEL",
-        Some("claude-sonnet-4-5"),
-        true,
-    )
-    .await
-}
+live_tool_roundtrip_test!(
+    live_openai_tool_roundtrip,
+    provider: "openai",
+    api_keys: &["OPENAI_API_KEY"],
+    model_env: "OPENAI_MODEL",
+    fallback: Some("gpt-5-mini"),
+    strict_json: true
+);
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn live_gemini_tool_roundtrip() -> Result<(), Box<dyn Error + Send + Sync>> {
-    run_tool_roundtrip(
-        "gemini",
-        &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "GEMINI_MODEL",
-        Some("gemini-2.5-flash"),
-        false,
-    )
-    .await
-}
+live_tool_roundtrip_test!(
+    live_anthropic_tool_roundtrip,
+    provider: "anthropic",
+    api_keys: &["ANTHROPIC_API_KEY"],
+    model_env: "ANTHROPIC_MODEL",
+    fallback: Some("claude-sonnet-4-5"),
+    strict_json: true
+);
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn live_grok_tool_roundtrip() -> Result<(), Box<dyn Error + Send + Sync>> {
-    run_tool_roundtrip(
-        "grok",
-        &["XAI_API_KEY", "GROK_API_KEY"],
-        "GROK_MODEL",
-        None,
-        true,
-    )
-    .await
-}
+live_tool_roundtrip_test!(
+    live_gemini_tool_roundtrip,
+    provider: "gemini",
+    api_keys: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    model_env: "GEMINI_MODEL",
+    fallback: Some("gemini-2.5-flash"),
+    strict_json: false
+);
+
+live_tool_roundtrip_test!(
+    live_grok_tool_roundtrip,
+    provider: "grok",
+    api_keys: &["XAI_API_KEY", "GROK_API_KEY"],
+    model_env: "GROK_MODEL",
+    fallback: None,
+    strict_json: true
+);

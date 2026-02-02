@@ -52,6 +52,15 @@ let result = agent.run(input).await?;
 println!("{}", result.output);
 ```
 
+Type-state builder alternative:
+
+```rust
+let input = RunInput::builder(())
+    .user_text("Hello!")
+    .usage_limits(UsageLimits::default())
+    .build();
+```
+
 ## Core concepts
 
 Example:
@@ -412,6 +421,12 @@ let schema = schemars::schema_for!(Summary);
 let agent = Agent::new(model).output_schema(serde_json::to_value(schema)?);
 ```
 
+Typed helper:
+
+```rust
+let agent = Agent::new(model).output_schema_for::<Summary>();
+```
+
 ## Failover and config resolvers
 
 Failover is based on `ResolvedModelConfig`:
@@ -629,6 +644,13 @@ Run tests:
 ```bash
 cargo test
 ```
+
+Deterministic test helpers live in `tests/support`:
+
+- `ScriptedModel` queues canned `ModelResponse` values for unit tests.
+- `StreamedModel` queues `StreamChunk` values for streaming tests.
+
+These are useful for message/usage assertions without live API calls.
 
 Example (run a single live test):
 

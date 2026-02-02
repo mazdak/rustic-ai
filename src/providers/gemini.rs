@@ -324,6 +324,70 @@ mod tests {
             Some(&json!({"ok": true}))
         );
     }
+
+    #[test]
+    fn helper_functions_cover_schema_and_media() {
+        let wrapped = gemini_response_object(&json!("ok"));
+        assert_eq!(
+            wrapped.get("return_value").and_then(|value| value.as_str()),
+            Some("ok")
+        );
+
+        let schema = json!({
+            "anyOf": [
+                { "type": "null" },
+                { "type": "string" }
+            ],
+            "title": "Example",
+            "additionalProperties": false
+        });
+        let sanitized = sanitize_gemini_schema(&schema);
+        assert_eq!(
+            sanitized.get("type"),
+            Some(&Value::String("string".to_string()))
+        );
+        assert!(sanitized.get("title").is_none());
+
+        assert_eq!(
+            infer_media_type_from_url("https://example.com/file.pdf"),
+            Some("application/pdf".to_string())
+        );
+        assert_eq!(
+            infer_media_type_from_url("https://example.com/file.unknown"),
+            None
+        );
+
+        let part = file_data_part("https://example.com/file.txt", &None);
+        let file_data = part.get("fileData").expect("file data");
+        assert_eq!(
+            file_data.get("mimeType"),
+            Some(&Value::String("text/plain".to_string()))
+        );
+    }
+
+    #[test]
+    fn helper_functions_cover_ids_and_truncation() {
+        let id = normalize_tool_call_id(Some("".to_string()));
+        assert!(id.starts_with("call_"));
+
+        let truncated = truncate_error_body(&"a".repeat(600));
+        assert!(truncated.contains("bytes"));
+    }
+
+    #[test]
+    fn sanitize_gemini_schema_removes_null_type_array() {
+        let schema = json!({
+            "type": ["null", "object"],
+            "properties": {"a": {"type": "string"}},
+            "$schema": "http://json-schema.org/draft-07/schema#"
+        });
+        let sanitized = sanitize_gemini_schema(&schema);
+        assert_eq!(
+            sanitized.get("type"),
+            Some(&Value::String("object".to_string()))
+        );
+        assert!(sanitized.get("$schema").is_none());
+    }
 }
 
 impl Provider for GeminiProvider {

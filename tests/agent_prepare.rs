@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use rustic_ai::{
-    Agent, FunctionTool, Model, ModelMessage, ModelRequestParameters, ModelResponse,
-    ModelResponsePart, RunContext, RunInput, ToolCallPart, ToolDefinition, ToolError,
+    Agent, AgentRunState, FunctionTool, Model, ModelMessage, ModelRequestParameters, ModelResponse,
+    ModelResponsePart, RunContext, RunInput, ToolCallPart, ToolDefinition, ToolError, ToolKind,
     ToolReturnPart, Toolset, UsageLimits, UserContent,
 };
 use schemars::JsonSchema;
@@ -235,5 +235,59 @@ async fn tool_name_collision_prefers_local() {
         call_count.load(Ordering::SeqCst),
         0,
         "toolset should not be called"
+    );
+}
+
+#[tokio::test]
+async fn prepare_tools_mutates_execution_definitions() {
+    let model = Arc::new(SequenceModel::new(vec![tool_call_response(
+        "delayed",
+        json!({"a": 1, "b": 2}),
+    )]));
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_clone = Arc::clone(&call_count);
+    let tool = FunctionTool::new("delayed", "add two numbers", move |_, _args: AddArgs| {
+        let call_count_clone = Arc::clone(&call_count_clone);
+        async move {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(AddResult { sum: 3 })
+        }
+    })
+    .expect("tool creation should succeed");
+
+    let mut agent = Agent::new(model);
+    agent.tool(tool);
+
+    let prepare = Arc::new(|_ctx: &RunContext<()>, defs: Vec<ToolDefinition>| {
+        let fut = async move {
+            let updated = defs
+                .into_iter()
+                .map(|mut def| {
+                    def.kind = ToolKind::Unapproved;
+                    def
+                })
+                .collect();
+            Ok(updated)
+        };
+        Box::pin(fut) as BoxFuture<'static, Result<Vec<ToolDefinition>, ToolError>>
+    });
+
+    let agent = agent.prepare_tools(prepare);
+    let input = RunInput::new(
+        vec![UserContent::Text("hello".to_string())],
+        vec![],
+        (),
+        UsageLimits::default(),
+    );
+
+    let result = agent.run(input).await.expect("run succeeds");
+    assert_eq!(result.state, AgentRunState::Deferred);
+    assert_eq!(result.deferred_calls.len(), 1);
+    assert_eq!(result.deferred_calls[0].kind, ToolKind::Unapproved);
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        0,
+        "tool should not execute when marked unapproved"
     );
 }

@@ -59,6 +59,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### RunInput Builder (Type-State)
+
+For more complex inputs, use the type-state builder to ensure the user prompt
+is provided before building:
+
+```rust
+use rustic_ai::{RunInput, UsageLimits};
+
+let input = RunInput::builder(())
+    .user_text("Summarize the latest report.")
+    .usage_limits(UsageLimits::default())
+    .build();
+```
+
 ## Adding Tools
 
 Tools are defined with typed arguments using `serde` and `schemars`:
@@ -87,6 +101,33 @@ let mut agent = Agent::new(model).system_prompt("You can do math.");
 agent.tool(tool);
 ```
 
+## Typed Structured Output
+
+Use a schema derived from a Rust type, similar to the AISDK-style `schema::<T>()`:
+
+```rust
+use rustic_ai::{Agent, RunInput, UsageLimits, UserContent, infer_model, infer_provider};
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchema)]
+struct Answer {
+    answer: String,
+}
+
+let model = infer_model("openai:gpt-4o-mini", infer_provider)?;
+let agent = Agent::new(model).output_schema_for::<Answer>();
+let input = RunInput::new(
+    vec![UserContent::Text("Respond with {\"answer\": \"ok\"}".to_string())],
+    vec![],
+    (),
+    UsageLimits::default(),
+);
+let result = agent.run(input).await?;
+let parsed = result.parsed_output.expect("parsed output");
+println!("Answer: {}", parsed["answer"]);
+```
+
 ## Providers
 
 RusticAI supports multiple LLM providers:
@@ -112,7 +153,7 @@ Stream responses with text deltas and tool call events:
 
 ```rust
 use futures::StreamExt;
-use rustic_ai::agent::AgentStreamEvent;
+use rustic_ai::AgentStreamEvent;
 
 let mut stream = agent.run_stream(input).await?;
 

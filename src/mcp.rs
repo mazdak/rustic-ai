@@ -435,3 +435,389 @@ where
         "mcp-http"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    #[derive(Default)]
+    struct RpcState {
+        tool_list_calls: usize,
+        tool_call_calls: usize,
+        last_tool_name: Option<String>,
+        resource_list_calls: usize,
+        resource_template_calls: usize,
+        resource_read_calls: usize,
+        prompt_list_calls: usize,
+        prompt_get_calls: usize,
+        last_resource_uri: Option<String>,
+    }
+
+    async fn spawn_rpc_server(
+        state: Arc<Mutex<RpcState>>,
+    ) -> Result<(String, tokio::task::JoinHandle<()>), ToolError> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| ToolError::Toolset(format!("bind failed: {e}")))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| ToolError::Toolset(format!("addr failed: {e}")))?;
+        let base_url = format!("http://{}", addr);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        let mut content_length: usize = 0;
+                        let mut saw_header = false;
+                        loop {
+                            let mut line = String::new();
+                            let bytes = reader.read_line(&mut line).await.unwrap_or(0);
+                            if bytes == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            saw_header = true;
+                            let lower = line.to_ascii_lowercase();
+                            if lower.starts_with("content-length:")
+                                && let Some(value) = line.split(':').nth(1)
+                            {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+
+                        if !saw_header {
+                            return;
+                        }
+
+                        let mut body = vec![0u8; content_length];
+                        if content_length > 0 && reader.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+
+                        let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+                        let id = request.get("id").cloned().unwrap_or(Value::Null);
+                        let params = request.get("params").cloned().unwrap_or(Value::Null);
+
+                        let result = match method {
+                            "tools/list" => {
+                                let mut guard = state.lock().unwrap();
+                                guard.tool_list_calls += 1;
+                                json!({
+                                    "tools": [{
+                                        "name": "echo",
+                                        "description": "Echo input",
+                                        "inputSchema": {"type": "object", "properties": {}},
+                                        "meta": {"version": 1},
+                                        "annotations": {"note": "test"},
+                                        "outputSchema": {"type": "object"}
+                                    }]
+                                })
+                            }
+                            "tools/call" => {
+                                let mut guard = state.lock().unwrap();
+                                guard.tool_call_calls += 1;
+                                guard.last_tool_name = params
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .map(|v| v.to_string());
+                                match guard.last_tool_name.as_deref() {
+                                    Some("structured") => {
+                                        json!({ "structuredContent": { "ok": true } })
+                                    }
+                                    Some("text") => {
+                                        json!({ "content": [ { "text": "hi" } ] })
+                                    }
+                                    _ => json!({ "value": 42 }),
+                                }
+                            }
+                            "resources/list" => {
+                                let mut guard = state.lock().unwrap();
+                                guard.resource_list_calls += 1;
+                                json!({ "resources": [{
+                                    "uri": "file:///tmp/example.txt",
+                                    "name": "example",
+                                    "description": "example resource",
+                                    "mimeType": "text/plain",
+                                    "metadata": {"version": 1}
+                                }] })
+                            }
+                            "resources/templates/list" => {
+                                let mut guard = state.lock().unwrap();
+                                guard.resource_template_calls += 1;
+                                json!({ "resourceTemplates": [{
+                                    "name": "example-template",
+                                    "description": "example template",
+                                    "uriTemplate": "file:///tmp/{name}",
+                                    "metadata": {"source": "test"}
+                                }] })
+                            }
+                            "resources/read" => {
+                                let mut guard = state.lock().unwrap();
+                                guard.resource_read_calls += 1;
+                                guard.last_resource_uri = params
+                                    .get("uri")
+                                    .and_then(Value::as_str)
+                                    .map(|v| v.to_string());
+                                json!({ "contents": [{
+                                    "uri": guard.last_resource_uri.clone().unwrap_or_default(),
+                                    "text": "hello"
+                                }] })
+                            }
+                            "prompts/list" => {
+                                let mut guard = state.lock().unwrap();
+                                guard.prompt_list_calls += 1;
+                                json!({ "prompts": [{
+                                    "name": "example-prompt",
+                                    "description": "example prompt",
+                                    "arguments": [{"name": "topic", "required": true}]
+                                }] })
+                            }
+                            "prompts/get" => {
+                                let mut guard = state.lock().unwrap();
+                                guard.prompt_get_calls += 1;
+                                json!({ "messages": [{
+                                    "role": "user",
+                                    "content": "hi"
+                                }] })
+                            }
+                            _ => {
+                                json!({ "error": { "message": "unknown method" } })
+                            }
+                        };
+
+                        let response = if result.get("error").is_some() {
+                            json!({ "jsonrpc": "2.0", "id": id, "error": result["error"] })
+                        } else {
+                            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                        };
+                        let response_bytes = response.to_string();
+                        let stream = reader.get_mut();
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                    response_bytes.len(),
+                                    response_bytes
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+
+        Ok((base_url, handle))
+    }
+
+    #[tokio::test]
+    async fn list_tools_applies_prefix_and_caches() {
+        let state = Arc::new(Mutex::new(RpcState::default()));
+        let (base_url, handle) = spawn_rpc_server(Arc::clone(&state)).await.expect("server");
+
+        let client = McpServerStreamableHttp::new(base_url)
+            .expect("client")
+            .with_tool_prefix("remote");
+
+        let ctx = RunContext {
+            run_id: "run".to_string(),
+            deps: Arc::new(()),
+            model: Arc::new(crate::providers::openai::OpenAIChatModel::new(
+                "gpt-test",
+                "key".to_string(),
+                Url::parse("https://example.com/").expect("url"),
+                None,
+            )),
+            usage: crate::usage::RunUsage::default(),
+            prompt: None,
+            messages: Arc::new(Vec::new()),
+            tool_call_id: None,
+            tool_name: None,
+        };
+
+        let tools = client.list_tools(&ctx).await.expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "remote__echo");
+        assert!(tools[0].metadata.is_some());
+
+        let tools_again = client.list_tools(&ctx).await.expect("tools again");
+        assert_eq!(tools_again.len(), 1);
+
+        let calls = state.lock().unwrap().tool_list_calls;
+        assert_eq!(calls, 1, "tools list should be cached");
+
+        client.invalidate_tools_cache().await;
+        let _ = client
+            .list_tools(&ctx)
+            .await
+            .expect("tools after invalidate");
+        let calls = state.lock().unwrap().tool_list_calls;
+        assert_eq!(calls, 2, "tools list should be refreshed");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn call_tool_returns_structured_or_text() {
+        let state = Arc::new(Mutex::new(RpcState::default()));
+        let (base_url, handle) = spawn_rpc_server(Arc::clone(&state)).await.expect("server");
+
+        let client = McpServerStreamableHttp::new(base_url)
+            .expect("client")
+            .with_tool_prefix("remote");
+
+        let ctx = RunContext {
+            run_id: "run".to_string(),
+            deps: Arc::new(()),
+            model: Arc::new(crate::providers::openai::OpenAIChatModel::new(
+                "gpt-test",
+                "key".to_string(),
+                Url::parse("https://example.com/").expect("url"),
+                None,
+            )),
+            usage: crate::usage::RunUsage::default(),
+            prompt: None,
+            messages: Arc::new(Vec::new()),
+            tool_call_id: None,
+            tool_name: None,
+        };
+
+        let structured = client
+            .call_tool(&ctx, "remote__structured", json!({}))
+            .await
+            .expect("structured");
+        assert_eq!(structured, json!({"ok": true}));
+
+        let text = client
+            .call_tool(&ctx, "remote__text", json!({}))
+            .await
+            .expect("text");
+        assert_eq!(text, Value::String("hi".to_string()));
+
+        let calls = state.lock().unwrap().tool_call_calls;
+        assert_eq!(calls, 2);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn list_resources_caches_and_invalidates() {
+        let state = Arc::new(Mutex::new(RpcState::default()));
+        let (base_url, handle) = spawn_rpc_server(Arc::clone(&state)).await.expect("server");
+
+        let client = McpServerStreamableHttp::new(base_url)
+            .expect("client")
+            .cache_resources(true);
+
+        let resources = client.list_resources().await.expect("resources");
+        assert_eq!(resources.len(), 1);
+        let resources_again = client.list_resources().await.expect("resources again");
+        assert_eq!(resources_again.len(), 1);
+
+        let calls = state.lock().unwrap().resource_list_calls;
+        assert_eq!(calls, 1);
+
+        client.invalidate_resources_cache().await;
+        let _ = client.list_resources().await.expect("resources refreshed");
+        let calls = state.lock().unwrap().resource_list_calls;
+        assert_eq!(calls, 2);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn list_prompts_and_get_prompt() {
+        let state = Arc::new(Mutex::new(RpcState::default()));
+        let (base_url, handle) = spawn_rpc_server(Arc::clone(&state)).await.expect("server");
+
+        let client = McpServerStreamableHttp::new(base_url)
+            .expect("client")
+            .cache_prompts(true);
+
+        let prompts = client.list_prompts().await.expect("prompts");
+        assert_eq!(prompts.len(), 1);
+        let prompts_again = client.list_prompts().await.expect("prompts again");
+        assert_eq!(prompts_again.len(), 1);
+
+        let calls = state.lock().unwrap().prompt_list_calls;
+        assert_eq!(calls, 1);
+
+        let messages = client
+            .get_prompt("example-prompt", None)
+            .await
+            .expect("prompt messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+
+        let calls = state.lock().unwrap().prompt_get_calls;
+        assert_eq!(calls, 1);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn list_templates_and_read_resource() {
+        let state = Arc::new(Mutex::new(RpcState::default()));
+        let (base_url, handle) = spawn_rpc_server(Arc::clone(&state)).await.expect("server");
+
+        let client = McpServerStreamableHttp::new(base_url).expect("client");
+        let templates = client.list_resource_templates().await.expect("templates");
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, "example-template");
+
+        let content = client
+            .read_resource("file:///tmp/example.txt")
+            .await
+            .expect("read resource");
+        let text = content
+            .get("contents")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(|value| value.as_str())
+            .expect("text");
+        assert_eq!(text, "hello");
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.resource_template_calls, 1);
+        assert_eq!(state.resource_read_calls, 1);
+        assert_eq!(
+            state.last_resource_uri.as_deref(),
+            Some("file:///tmp/example.txt")
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn cache_prompts_can_be_disabled() {
+        let state = Arc::new(Mutex::new(RpcState::default()));
+        let (base_url, handle) = spawn_rpc_server(Arc::clone(&state)).await.expect("server");
+
+        let client = McpServerStreamableHttp::new(base_url)
+            .expect("client")
+            .cache_prompts(false);
+
+        let _ = client.list_prompts().await.expect("prompts");
+        let _ = client.list_prompts().await.expect("prompts again");
+
+        let calls = state.lock().unwrap().prompt_list_calls;
+        assert_eq!(calls, 2);
+
+        handle.abort();
+    }
+}

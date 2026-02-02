@@ -411,6 +411,304 @@ pub enum ServerEvent {
     Unknown,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn session_update_serializes() {
+        let event = ClientEvent::SessionUpdate {
+            session: SessionUpdatePayload {
+                instructions: Some("be concise".to_string()),
+                voice: Some("alloy".to_string()),
+                turn_detection: Some(TurnDetection::default()),
+                tools: Some(vec![GrokToolDefinition::function(
+                    "echo",
+                    "echo back",
+                    json!({"type": "object", "properties": {}}),
+                )]),
+                temperature: Some(0.3),
+                audio: Some(AudioConfig {
+                    input: AudioChannelConfig {
+                        format: AudioFormat {
+                            format_type: "audio/pcm".to_string(),
+                            rate: Some(16_000),
+                        },
+                    },
+                    output: AudioChannelConfig {
+                        format: AudioFormat {
+                            format_type: "audio/pcm".to_string(),
+                            rate: Some(16_000),
+                        },
+                    },
+                }),
+            },
+        };
+
+        let value = serde_json::to_value(event).expect("serialize");
+        assert_eq!(
+            value.get("type"),
+            Some(&Value::String("session.update".to_string()))
+        );
+        assert_eq!(
+            value
+                .get("session")
+                .and_then(|v| v.get("instructions"))
+                .and_then(|v| v.as_str()),
+            Some("be concise")
+        );
+        assert_eq!(
+            value
+                .get("session")
+                .and_then(|v| v.get("voice"))
+                .and_then(|v| v.as_str()),
+            Some("alloy")
+        );
+    }
+
+    #[test]
+    fn conversation_item_helpers_build_expected_shapes() {
+        let output = ConversationItem::function_call_output("call-1".to_string(), "ok".to_string());
+        let output_value = serde_json::to_value(output).expect("serialize output");
+        assert_eq!(
+            output_value.get("type"),
+            Some(&Value::String("function_call_output".to_string()))
+        );
+        assert_eq!(
+            output_value.get("call_id"),
+            Some(&Value::String("call-1".to_string()))
+        );
+        assert_eq!(
+            output_value.get("output"),
+            Some(&Value::String("ok".to_string()))
+        );
+
+        let user = ConversationItem::user_text("hello");
+        let user_value = serde_json::to_value(user).expect("serialize user");
+        assert_eq!(
+            user_value.get("type"),
+            Some(&Value::String("message".to_string()))
+        );
+        assert_eq!(
+            user_value.get("role"),
+            Some(&Value::String("user".to_string()))
+        );
+        let content = user_value
+            .get("content")
+            .and_then(|v| v.as_array())
+            .expect("content array");
+        assert_eq!(
+            content[0].get("type"),
+            Some(&Value::String("input_text".to_string()))
+        );
+    }
+
+    #[test]
+    fn tool_definition_from_tool() {
+        let tool = crate::tools::ToolDefinition::new(
+            "tool",
+            Some("desc".to_string()),
+            json!({"type": "object", "properties": {}}),
+        );
+        let def: GrokToolDefinition = (&tool).into();
+        assert_eq!(def.tool_type, "function");
+        assert_eq!(def.name, "tool");
+        assert_eq!(def.description.as_deref(), Some("desc"));
+        assert!(def.parameters.is_some());
+    }
+
+    #[test]
+    fn server_event_helpers_extract_audio_and_tool_calls() {
+        let audio_event = ServerEvent::ResponseAudioDelta {
+            event_id: "evt".to_string(),
+            response_id: "resp".to_string(),
+            item_id: "item".to_string(),
+            output_index: 0,
+            content_index: 0,
+            delta: "audio".to_string(),
+        };
+        assert_eq!(audio_event.audio_delta(), Some("audio"));
+        assert!(audio_event.function_call().is_none());
+
+        let output_audio_event = ServerEvent::ResponseOutputAudioDelta {
+            event_id: "evt".to_string(),
+            response_id: "resp".to_string(),
+            item_id: "item".to_string(),
+            output_index: 0,
+            content_index: 0,
+            delta: "audio2".to_string(),
+        };
+        assert_eq!(output_audio_event.audio_delta(), Some("audio2"));
+
+        let call_event = ServerEvent::ResponseFunctionCallArgumentsDone {
+            event_id: "evt".to_string(),
+            response_id: "resp".to_string(),
+            item_id: "item".to_string(),
+            output_index: 0,
+            call_id: "call".to_string(),
+            name: "tool".to_string(),
+            arguments: "{\"a\":1}".to_string(),
+        };
+        let call = call_event.function_call().expect("function call");
+        assert_eq!(call.call_id, "call");
+        assert_eq!(call.name, "tool");
+    }
+
+    #[test]
+    fn function_call_to_tool_call_part_parses_json_or_string() {
+        let call = FunctionCall {
+            call_id: "call-1".to_string(),
+            name: "tool".to_string(),
+            arguments: "{\"a\":1}".to_string(),
+        };
+        let part = call.to_tool_call_part();
+        assert_eq!(part.name, "tool");
+        assert_eq!(part.arguments, json!({"a": 1}));
+
+        let call = FunctionCall {
+            call_id: "call-2".to_string(),
+            name: "tool".to_string(),
+            arguments: "not-json".to_string(),
+        };
+        let part = call.to_tool_call_part();
+        assert_eq!(part.arguments, Value::String("not-json".to_string()));
+    }
+
+    #[test]
+    fn session_config_builders_populate_payload() {
+        let config = SessionConfig::new("hello")
+            .with_voice("Nova")
+            .with_temperature(0.4)
+            .with_audio_format("audio/pcm", Some(16_000))
+            .with_turn_detection(TurnDetection::default());
+        let payload = config.to_update_payload();
+        assert_eq!(payload.instructions.as_deref(), Some("hello"));
+        assert_eq!(payload.voice.as_deref(), Some("Nova"));
+        assert!(payload.tools.is_none());
+        assert_eq!(payload.temperature, Some(0.4));
+        let audio = payload.audio.expect("audio");
+        assert_eq!(audio.input.format.format_type, "audio/pcm");
+        assert_eq!(audio.input.format.rate, Some(16_000));
+
+        let tools = vec![GrokToolDefinition::function(
+            "echo",
+            "Echo back",
+            json!({"type": "object"}),
+        )];
+        let config = SessionConfig::default().with_tools(tools.clone());
+        let payload = config.to_update_payload();
+        assert!(payload.tools.is_some());
+        assert_eq!(payload.tools.unwrap().len(), tools.len());
+    }
+
+    #[tokio::test]
+    async fn grok_sender_emits_events() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let sender = GrokSender { tx };
+
+        sender
+            .send_audio("audio".to_string())
+            .await
+            .expect("send audio");
+        match rx.recv().await.expect("audio event") {
+            ClientEvent::InputAudioBufferAppend { audio, .. } => {
+                assert_eq!(audio, "audio");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        sender
+            .send_user_text("hello".to_string())
+            .await
+            .expect("send text");
+        match rx.recv().await.expect("user event") {
+            ClientEvent::ConversationItemCreate { item, .. } => {
+                assert_eq!(item.item_type, "message");
+                assert_eq!(item.role.as_deref(), Some("user"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        sender
+            .send_tool_result("call-1".to_string(), "ok".to_string())
+            .await
+            .expect("send tool result");
+        match rx.recv().await.expect("tool result") {
+            ClientEvent::ConversationItemCreate { item, .. } => {
+                assert_eq!(item.item_type, "function_call_output");
+                assert_eq!(item.call_id.as_deref(), Some("call-1"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        match rx.recv().await.expect("response create") {
+            ClientEvent::ResponseCreate { response, .. } => {
+                assert!(response.is_none());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        sender
+            .request_response(Some(vec!["text".to_string()]))
+            .await
+            .expect("request response");
+        match rx.recv().await.expect("response create") {
+            ClientEvent::ResponseCreate { response, .. } => {
+                let response = response.expect("response payload");
+                assert_eq!(response.modalities, Some(vec!["text".to_string()]));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        sender.cancel_response().await.expect("cancel response");
+        match rx.recv().await.expect("cancel event") {
+            ClientEvent::ResponseCancel { .. } => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        sender.commit_audio().await.expect("commit audio");
+        match rx.recv().await.expect("commit event") {
+            ClientEvent::ConversationItemCommit { .. } => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn misc_helpers_cover_key_generation_and_host_extraction() {
+        let key = generate_ws_key();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(key.as_bytes())
+            .expect("decode");
+        assert_eq!(decoded.len(), 16);
+
+        assert_eq!(
+            extract_host("wss://api.x.ai/v1/realtime"),
+            "api.x.ai".to_string()
+        );
+        assert_eq!(
+            extract_host("ws://localhost:8080/socket"),
+            "localhost:8080".to_string()
+        );
+
+        let detection = TurnDetection::default();
+        assert_eq!(detection.detection_type, "server_vad");
+        assert_eq!(detection.threshold, Some(0.5));
+    }
+
+    #[test]
+    fn tool_definition_constructor_sets_fields() {
+        let def = GrokToolDefinition::function(
+            "tool",
+            "desc",
+            json!({"type": "object", "properties": {}}),
+        );
+        assert_eq!(def.tool_type, "function");
+        assert_eq!(def.name, "tool");
+        assert_eq!(def.description.as_deref(), Some("desc"));
+        assert!(def.parameters.is_some());
+    }
+}
+
 impl ServerEvent {
     /// Extract audio delta if this is an audio event
     pub fn audio_delta(&self) -> Option<&str> {

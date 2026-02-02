@@ -134,3 +134,42 @@ pub fn init_datadog_tracing(
         provider: tracer_provider,
     })
 }
+
+#[cfg(all(test, feature = "telemetry-otel"))]
+mod otel_tests {
+    use super::*;
+
+    #[test]
+    fn init_otlp_tracing_allows_subscriber_conflicts() {
+        let result = init_otlp_tracing(
+            "rustic-ai-test",
+            opentelemetry_otlp::Protocol::HttpBinary,
+            Some("http://localhost:4318"),
+            Some("info"),
+        );
+        if let Err(err) = result {
+            match err {
+                TelemetryError::Subscriber(_) | TelemetryError::OTel(_) => {}
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "telemetry-datadog"))]
+mod datadog_tests {
+    use super::*;
+
+    #[test]
+    fn init_datadog_tracing_allows_subscriber_conflicts() {
+        let result = init_datadog_tracing(
+            "rustic-ai-test",
+            Some("http://localhost:8126"),
+            Some("info"),
+        );
+        if let Err(err) = result {
+            match err {
+                TelemetryError::Subscriber(_) | TelemetryError::OTel(_) => {}
+            }
+        }
+    }
+}

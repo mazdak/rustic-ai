@@ -1,6 +1,6 @@
 [package]
 name = "rustic-ai"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Mazdak Rezvani"]
 description = "A Rust-native agent framework with tool calling, streaming, and multi-provider support for OpenAI, Anthropic, Gemini, and Grok"
@@ -37,7 +37,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "reg
 
 [dev-dependencies]
 dotenvy = "0.15.7"
-tokio = { version = "1.40.0", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.40.0", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
 
 [features]
 default = []
